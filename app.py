@@ -230,15 +230,44 @@ with tabs[0]:
     if st.button("TẢI EXCEL TỪ DRIVE",disabled=not url):
         try:
             tmp=tempfile.mkdtemp()
-            p=gdown.download(url=url,output=os.path.join(tmp,"source.xlsx"),quiet=True,fuzzy=True)
-            if not p: raise ValueError("Không tải được file. Kiểm tra quyền chia sẻ công khai.")
-            groups,df,rows_by_id,sheet=parse_workbook(Path(p).read_bytes())
-            st.session_state.source_data={"groups":groups,"df":df,"sheet":sheet,"rows":rows_by_id}
-            st.success(f"Đã đọc {len(groups)} nhóm hàng và 9 nhân viên.")
+            if "/folders/" in url:
+                # Public Drive folder: download its contents, then select Excel workbooks.
+                gdown.download_folder(url=url, output=tmp, quiet=True, use_cookies=False)
+                candidates=list(Path(tmp).rglob("*.xlsx"))
+                candidates += list(Path(tmp).rglob("*.xlsm"))
+                if not candidates:
+                    raise ValueError("Thư mục Drive không có file Excel .xlsx/.xlsm. Hãy kiểm tra quyền xem công khai.")
+                if len(candidates)>1:
+                    st.session_state.drive_excel_candidates=[str(x) for x in candidates]
+                    st.info("Thư mục có nhiều file Excel. Chọn đúng file ở danh sách bên dưới.")
+                else:
+                    chosen=candidates[0]
+                    groups,df,rows_by_id,sheet=parse_workbook(chosen.read_bytes())
+                    st.session_state.source_data={"groups":groups,"df":df,"sheet":sheet,"rows":rows_by_id}
+                    st.success(f"Đã đọc {len(groups)} nhóm hàng và 9 nhân viên từ {chosen.name}.")
+            else:
+                # File URL: omit fuzzy for compatibility with older gdown versions.
+                p=gdown.download(url=url, output=os.path.join(tmp,"source.xlsx"), quiet=True)
+                if not p: raise ValueError("Không tải được file. Kiểm tra quyền chia sẻ công khai.")
+                groups,df,rows_by_id,sheet=parse_workbook(Path(p).read_bytes())
+                st.session_state.source_data={"groups":groups,"df":df,"sheet":sheet,"rows":rows_by_id}
+                st.success(f"Đã đọc {len(groups)} nhóm hàng và 9 nhân viên.")
         except Exception as e: st.error(f"Lỗi Google Drive: {e}")
     if st.session_state.source_data:
         st.metric("Nhóm hàng tự nhận diện",len(st.session_state.source_data["groups"]))
         st.metric("Nhân viên",9)
+    if st.session_state.get("drive_excel_candidates"):
+        candidate_paths=st.session_state.drive_excel_candidates
+        labels=[Path(x).name for x in candidate_paths]
+        chosen_label=st.selectbox("Chọn file Excel trong thư mục Drive",labels)
+        if st.button("ĐỌC FILE ĐÃ CHỌN"):
+            chosen=Path(candidate_paths[labels.index(chosen_label)])
+            try:
+                groups,df,rows_by_id,sheet=parse_workbook(chosen.read_bytes())
+                st.session_state.source_data={"groups":groups,"df":df,"sheet":sheet,"rows":rows_by_id}
+                st.success(f"Đã đọc {len(groups)} nhóm hàng và 9 nhân viên từ {chosen.name}.")
+            except Exception as e: st.error(str(e))
+
 with tabs[1]:
     src=st.session_state.source_data
     if not src: st.info("Nạp file Excel ở bước ① trước.")
