@@ -1,9 +1,5 @@
-# Báo cáo sức khỏe chiến binh — MVP v2
-- Giao diện chia 4 tab, cấu hình bên trái.
-- ZIP / nhiều ảnh / Google Drive công khai.
-- Dữ liệu ảnh được giữ trong session state, không mất do thư mục tạm tạo lại ở mỗi lần Streamlit rerun.
-- OCR đọc chữ và nhận diện mã NV; mapping nhóm hàng/tỷ lệ vẫn cần xác minh.
-- Nhập bảng chuẩn hoặc CSV để tính và xuất Excel + PNG.
-## Deploy
-Upload toàn bộ file vào GitHub repository hiện tại, thay thế các file cũ. Streamlit Cloud sẽ tự khởi chạy lại.
+# Báo cáo Chiến Binh V3
+Cập nhật file này lên GitHub repository đang kết nối với Streamlit Cloud, ghi đè `app.py`, `requirements.txt`, `packages.txt`.
 Main file: app.py
+MVP V3 nạp ZIP/ảnh/Drive công khai, OCR, tạo ma trận 9x38 và cho phép rà soát thủ công trước khi xuất.
+Lưu ý: OCR heuristic chưa đảm bảo 100%; mọi ô trống cần xác minh. TARGET 38 nhóm được cấu hình từ ảnh Lũy kế ngày 09/11, cột TARGET.
