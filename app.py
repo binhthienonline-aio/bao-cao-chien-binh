@@ -168,7 +168,7 @@ def build_png(groups,df,report_date):
     fig_w=max(18,1.45*(n+1))
     fig_h=7.2
     fig,ax=plt.subplots(figsize=(fig_w,fig_h))
-    ax.set_xlim(0,n+1); ax.set_ylim(0,11); ax.invert_yaxis(); ax.axis("off")
+    ax.set_xlim(0,n+1.05); ax.set_ylim(0,11); ax.invert_yaxis(); ax.axis("off")
     colw=[2.1]+[1.0]*n
     x=[0]
     for w in colw: x.append(x[-1]+w)
@@ -195,7 +195,7 @@ def build_png(groups,df,report_date):
         for j,g in enumerate(groups,1):
             v=row[g]
             ax.text(x[j]+colw[j]/2,y+.5,f"{v:.2f}" if pd.notna(v) else "",ha="center",va="center",fontsize=5.1)
-    ax.set_title(f"BÁO CÁO SỨC KHỎE CHIẾN BINH — {report_date}",fontsize=11,weight="bold",pad=10)
+    ax.set_xlim(0,x[-1]); ax.set_title(f"BÁO CÁO SỨC KHỎE CHIẾN BINH — {report_date}",fontsize=11,weight="bold",pad=10)
     fig.tight_layout()
     b=io.BytesIO(); fig.savefig(b,format="png",dpi=220,bbox_inches="tight"); plt.close(fig); b.seek(0); return b
 
@@ -291,9 +291,27 @@ with tabs[2]:
     if not src: st.info("Nạp Excel ở bước ① trước.")
     else:
         groups=src["groups"]; df=src["df"]
-        st.markdown("**Bản xem trước — đúng thứ tự nhóm hàng và 9 nhân viên đã chốt.**")
-        st.dataframe(df[["Nhân viên"]+groups],use_container_width=True,height=460)
-        st.caption("Dòng TỔNG sẽ được tính từ 9 nhân viên khi xuất file.")
+        st.markdown("**Bản xem trước — có dòng TỔNG, đúng thứ tự nhóm hàng và 9 nhân viên đã chốt.**")
+        preview=df[["Nhân viên"]+groups].copy()
+        total_row={"Nhân viên":"TỔNG"}
+        for g in groups:
+            vals=pd.to_numeric(df[g],errors="coerce")
+            total_row[g]=float(vals.sum()) if vals.notna().all() else None
+        preview=pd.concat([pd.DataFrame([total_row]),preview],ignore_index=True)
+        def color_preview_row(row):
+            bg = "#FFC000" if row.name == 0 else "#DDEBF7"
+            weight = "bold" if row.name == 0 else "normal"
+            return [f"background-color: {bg}; color: #000000; font-weight: {weight}; border: 1px solid #202020;"]*len(row)
+        styled=(preview.style
+                .apply(color_preview_row,axis=1)
+                .set_table_styles([
+                    {"selector":"th","props":[("background-color","#FFF200"),("color","#000000"),("font-weight","bold"),("border","1px solid #202020"),("white-space","normal"),("min-width","110px")]},
+                    {"selector":"td","props":[("border","1px solid #202020"),("text-align","center"),("padding","4px")]},
+                    {"selector":"th:first-child, td:first-child","props":[("min-width","190px"),("text-align","left")]}
+                ])
+                .format({g:"{:,.2f}" for g in groups},na_rep=""))
+        st.dataframe(styled,use_container_width=True,height=520,hide_index=True)
+        st.caption("Màu vàng: tiêu đề nhóm hàng • Màu cam: dòng TỔNG • Xanh nhạt: dữ liệu 9 nhân viên.")
 with tabs[3]:
     src=st.session_state.source_data
     if not src: st.info("Nạp Excel ở bước ① trước.")
