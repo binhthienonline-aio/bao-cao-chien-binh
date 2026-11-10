@@ -1,16 +1,20 @@
-# Báo cáo Chiến Binh V4 — bản theo mẫu ma trận
-Cập nhật lên GitHub repository đang kết nối Streamlit Cloud, ghi đè app.py và requirements.txt.
-Main file: app.py
+# BÁO CÁO CHIẾN BINH V5 — IMAGE ONLY
 
-## Đầu vào
-- Excel nguồn `.xlsx` có sheet `ThiDua` theo mẫu: nhóm hàng ở dòng 1 từ cột B trở đi; mã/tên nhân viên ở cột A.
-- ZIP dashboard tùy chọn để xác nhận 9 mã nhân viên có trong ảnh.
+## Nguyên tắc dữ liệu
+- Không đọc file Excel tháng 10.
+- Ảnh Lũy kế: đọc động tên nhóm hàng và cột TARGET theo từng hàng của bảng.
+- 9 ảnh Dashboard: phát hiện từng thẻ trắng trong vùng THI ĐUA, OCR nhãn và tỷ lệ.
+- Danh sách "Chưa có số liệu" được đọc riêng; chỉ các nhóm ghép được từ danh sách này mới tự gán 0.
+- Nhóm không ghép chắc chắn để trống; không tự suy đoán.
+- Tạo ma trận nhân viên × nhóm; doanh số = TARGET siêu thị × hệ số / 9 × tỷ lệ / 100.
+- Xuất Excel theo mẫu vàng/cam/xanh và PNG tương ứng.
 
-## Xử lý
-- Tự đọc số lượng nhóm hàng và thứ tự cột từ Excel.
-- Lọc đúng 9 mã nhân viên đã chốt, theo thứ tự trong ảnh mẫu.
-- Không tự đổi ô trống thành 0.
-- Dòng TỔNG tính lại từ 9 nhân viên.
-- Xuất Excel và PNG theo bố cục vàng/cam/xanh nhạt.
+## Cập nhật Streamlit
+Upload/ghi đè `app.py`, `requirements.txt`, `packages.txt` vào repository GitHub đang kết nối Streamlit Cloud.
+Main file: `app.py`.
 
-Lưu ý: doanh số phải có trong Excel nguồn; ảnh dashboard được dùng đối chiếu, không dùng OCR làm nguồn số chính để tránh sai lệch.
+## File đầu vào
+Một ZIP gồm 9 PNG dashboard, tên file có mã nhân viên (ví dụ `suc-khoe-nv-137501-202611.png`) và 1 ảnh Lũy kế (tên file có `Lũy kế` hoặc `Luy ke`). Có thể tải ZIP trực tiếp hoặc dán link Drive công khai.
+
+## Lưu ý
+OCR không phải nguồn dữ liệu tuyệt đối. Các ô chưa chắc chắn để trống, có thể sửa trực tiếp ở bước rà soát trước khi dùng báo cáo chính thức.
