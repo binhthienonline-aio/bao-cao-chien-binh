@@ -25,7 +25,7 @@ div.stButton>button,div.stDownloadButton>button{border-radius:8px;font-weight:65
 </style>
 """, unsafe_allow_html=True)
 st.markdown(
-    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5</h1>'
+    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5.1 AUTO ZERO</h1>'
     '<p>Chỉ đọc ảnh tháng 11 • Lũy kế là doanh số gốc • Dashboard là tỷ lệ phân bổ • Xuất Excel và PNG theo mẫu</p></div>',
     unsafe_allow_html=True
 )
@@ -317,7 +317,16 @@ def card_ocr(bgr, box):
             counts[value] = counts.get(value, 0) + 1
         pct = sorted(counts.items(), key=lambda x: (x[1], -abs(x[0])))[-1][0]
         if counts[pct] == 1 and len(parsed) > 1:
-            pct = None  # disagreement -> require manual review
+            pct = None  # disagreement -> require review
+
+    # Fallback for an important OCR edge case: the colored-number crop can miss
+    # a red/green "0%" glyph, while OCR of the complete card still reads it.
+    # Accept ONLY an explicit zero-percent token from the card itself; never
+    # convert a missing/unknown percentage to zero.
+    if pct is None:
+        full_card_pct = re.findall(r"(?<![0-9])0\s*%", label_text)
+        if full_card_pct:
+            pct = 0.0
 
     label = re.sub(r"-?\s*\d{1,3}\s*%", " ", label_text)
     label = re.sub(r"[\n\r]+", " ", label)
@@ -748,7 +757,7 @@ with tabs[1]:
                 "Ô đã nhận diện": len(r["values"]), "Ô cần rà soát": len(groups) - len(r["values"])
             })
         st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
-        st.caption("Số ô đã nhận diện gồm tỷ lệ từ thẻ và số 0 chỉ khi có tên trong danh sách 'Chưa có số liệu'.")
+        st.caption("Số ô đã nhận diện gồm tỷ lệ trên thẻ, số 0% đọc được trực tiếp từ toàn thẻ và nhóm nằm trong danh sách 'Chưa có số liệu'.")
         with st.expander("Xem nhật ký từng thẻ OCR"):
             st.dataframe(st.session_state.card_audit, use_container_width=True, hide_index=True)
         with st.expander("Xem nguyên văn danh sách 'Chưa có số liệu'"):
@@ -788,7 +797,7 @@ with tabs[2]:
 
         st.divider()
         st.markdown("### B. Tạo ma trận tỷ lệ 9 nhân viên × nhóm hàng")
-        st.caption("Tỷ lệ từ thẻ được giữ nguyên, 0 chỉ lấy từ danh sách 'Chưa có số liệu'. Ô không đọc được để trống.")
+        st.caption("Tỷ lệ từ thẻ được giữ nguyên. Nếu OCR số màu bỏ sót nhưng OCR toàn thẻ đọc rõ 0%, hệ thống tự ghi nhận 0%; ô không xác minh được vẫn để trống.")
         if st.button("TẠO / CẬP NHẬT MA TRẬN", type="primary"):
             if target_input["Lũy kế cửa hàng"].isna().any() or not all(str(x).strip() for x in group_names):
                 st.error("Hãy hoàn tất tên nhóm và LŨY KẾ trước.")
