@@ -25,7 +25,7 @@ div.stButton>button,div.stDownloadButton>button{border-radius:8px;font-weight:65
 </style>
 """, unsafe_allow_html=True)
 st.markdown(
-    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5.1 AUTO ZERO</h1>'
+    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5.2 LŨY KẾ ONLY</h1>'
     '<p>Chỉ đọc ảnh tháng 11 • Lũy kế là doanh số gốc • Dashboard là tỷ lệ phân bổ • Xuất Excel và PNG theo mẫu</p></div>',
     unsafe_allow_html=True
 )
@@ -144,6 +144,60 @@ def _runs(binary_array):
         runs.append((start, len(binary_array) - 1, len(binary_array) - start))
     return runs
 
+
+def _norm_ocr_token(value):
+    value = unicodedata.normalize("NFD", str(value).upper())
+    return "".join(ch for ch in value if unicodedata.category(ch) != "Mn" and ch.isalnum())
+
+def detect_luyke_column_from_header(bgr):
+    """Locate the LŨY KẾ column from its own header; never infer it from TARGET position."""
+    h, w = bgr.shape[:2]
+    header_img = bgr[:int(h * 0.68), :]
+    data = pytesseract.image_to_data(
+        header_img, lang="vie+eng", config="--psm 11",
+        output_type=pytesseract.Output.DICT
+    )
+    lines = {}
+    for i, raw in enumerate(data.get("text", [])):
+        token = _norm_ocr_token(raw)
+        if not token:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        x = data["left"][i] + data["width"][i] / 2
+        y = data["top"][i] + data["height"][i] / 2
+        lines.setdefault(key, []).append((token, x, y))
+
+    candidates = []
+    for words in lines.values():
+        tokens = [x[0] for x in words]
+        # The correct header row contains LŨY KẾ, MỤC TIÊU and TARGET together.
+        has_luy = any(t.startswith("LUY") for t in tokens)
+        has_ke = any(t.startswith("KE") for t in tokens)
+        has_target = any(t.startswith("TARGET") for t in tokens)
+        has_muctieu = any(t.startswith("MUC") for t in tokens) or any(t.startswith("TIEU") for t in tokens)
+        if has_luy and has_ke and has_target and has_muctieu:
+            def center(prefix):
+                vals = [x for t, x, _ in words if t.startswith(prefix)]
+                return sum(vals) / len(vals) if vals else None
+            luy = center("LUY")
+            ke = center("KE")
+            target = center("TARGET")
+            muc = center("MUC")
+            tieu = center("TIEU")
+            prev = [v for v in (muc, tieu) if v is not None and v < luy]
+            if luy is not None and ke is not None and target is not None and prev:
+                luy_center = (luy + ke) / 2
+                candidates.append((abs(sum(x[2] for x in words) / len(words) - h * 0.42),
+                                   (max(0, int((max(prev) + luy_center) / 2)),
+                                    min(w, int((luy_center + target) / 2)))))
+    if not candidates:
+        raise ValueError("Không nhận diện chắc chắn tiêu đề cột LŨY KẾ. Ứng dụng đã dừng để tránh lấy nhầm TARGET.")
+    candidates.sort(key=lambda x: x[0])
+    x0, x1 = candidates[0][1]
+    if x1 - x0 < w * 0.025:
+        raise ValueError("Không xác định được bề rộng cột LŨY KẾ. Vui lòng dùng ảnh rõ tiêu đề.")
+    return (x0, x1)
+
 def find_target_table_geometry(bgr):
     """Find the monthly Luy ke table, including wrapped rows in the mobile screenshot."""
     h, w = bgr.shape[:2]
@@ -197,18 +251,14 @@ def find_target_table_geometry(bgr):
         if length <= 4 and a > int(w * 0.01) and b < int(w * 0.995):
             vlines.append(int((a + b) / 2))
 
-    if len(vlines) >= 8:
-        # STT | Group | Expected | Target/NV | Luy ke | TARGET | Remaining | Change
+    if len(vlines) >= 3:
+        # Group name is still read from its own column. LŨY KẾ is located
+        # independently from the printed header text, not by a fixed column index.
         group_x = (vlines[1], vlines[2])
-        luyke_x = (vlines[4], vlines[5])
-        target_x = (vlines[5], vlines[6])
     else:
-        # Fallback for the older exported worksheet layout.
         group_x = (int(w * 0.075), int(w * 0.354))
-        luyke_x = (int(w * 0.599), int(w * 0.688))
-        target_x = (int(w * 0.688), int(w * 0.778))
-
-    return row_lines, group_x, luyke_x, target_x
+    luyke_x = detect_luyke_column_from_header(bgr)
+    return row_lines, group_x, luyke_x, None
 
 def parse_target_image(raw):
     bgr = image_bytes_to_bgr(raw)
@@ -232,13 +282,9 @@ def parse_target_image(raw):
             config="--psm 7 -c tessedit_char_whitelist=0123456789,."
         )
         luyke = parse_numeric(luyke_text)
-        target_crop = pil.crop((target_x[0] + 3, y0 + 3, target_x[1] - 3, y1 - 3))
-        target_crop = target_crop.resize((max(1, target_crop.width * 2), max(1, target_crop.height * 2)))
-        target_text = pytesseract.image_to_string(
-            target_crop, lang="eng",
-            config="--psm 7 -c tessedit_char_whitelist=0123456789,."
-        )
-        target = parse_numeric(target_text)
+        # TARGET is deliberately not read or used in the distribution calculation.
+        target_text = "BỎ QUA THEO YÊU CẦU: CHỈ DÙNG CỘT LŨY KẾ"
+        target = None
         records.append({
             "STT": i + 1,
             "Nhóm hàng": name,
@@ -708,7 +754,7 @@ with tabs[0]:
 
 with tabs[1]:
     st.markdown("### Phân tích ảnh Lũy kế và 9 Dashboard")
-    st.info("Tên nhóm và TARGET đọc từ từng dòng của ảnh Lũy kế. Tỷ lệ đọc từ từng thẻ trắng trong phần THI ĐUA. File Excel tháng 10 không được sử dụng.")
+    st.info("Tên nhóm đọc theo từng dòng. Doanh số chỉ lấy từ cột LŨY KẾ theo tiêu đề nhận diện trực tiếp; TARGET và các cột khác bị bỏ qua hoàn toàn. Tỷ lệ đọc từ từng thẻ trong Dashboard.")
     if st.button("▶ PHÂN TÍCH 10 ẢNH", type="primary", disabled=not st.session_state.image_items):
         target_images, employee_files, missing_codes, duplicate_codes, other_files = identify_sources(st.session_state.image_items)
         if not target_images:
