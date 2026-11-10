@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Báo cáo Chiến Binh V8", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Báo cáo Chiến Binh V5", page_icon="📊", layout="wide")
 st.markdown("""
 <style>
 .block-container{max-width:1600px;padding-top:1.1rem}
@@ -25,8 +25,8 @@ div.stButton>button,div.stDownloadButton>button{border-radius:8px;font-weight:65
 </style>
 """, unsafe_allow_html=True)
 st.markdown(
-    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V8</h1>'
-    '<p>Chỉ đọc ảnh tháng 11 • Lũy kế đọc riêng THỰC HIỆN + TARGET • Phân bổ theo tỷ trọng Dashboard</p></div>',
+    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5</h1>'
+    '<p>Chỉ đọc ảnh tháng 11 • Lũy kế lấy TARGET • Dashboard lấy tỷ lệ • Xuất Excel và PNG theo mẫu</p></div>',
     unsafe_allow_html=True
 )
 
@@ -122,16 +122,6 @@ def identify_sources(images):
             employee_files.setdefault(code, []).append((name, raw))
         else:
             others.append(name)
-    # Nếu Drive còn lưu cả ảnh Lũy kế cũ và mới, ưu tiên ảnh chụp màn hình điện thoại
-    # có tỷ lệ dọc lớn; không lấy ảnh bảng Excel cũ làm nguồn THỰC HIỆN.
-    def target_rank(item):
-        try:
-            img = Image.open(io.BytesIO(item[1]))
-            w, h = img.size
-            return (h / max(w, 1), h * w)
-        except Exception:
-            return (0, 0)
-    target.sort(key=target_rank, reverse=True)
     missing = [c for c, _ in EMPLOYEES if c not in employee_files]
     duplicates = [c for c, v in employee_files.items() if len(v) > 1]
     return target, employee_files, missing, duplicates, others
@@ -188,162 +178,16 @@ def find_target_table_geometry(bgr):
         target_x = (int(w * 0.688), int(w * 0.778))
     return best_seq, group_x, target_x
 
-
-def _ocr_words_in_crop(pil, box, lang="eng", config="--psm 6", scale=3):
-    """OCR từ một cột riêng; trả về token cùng tọa độ Y trên ảnh gốc."""
-    x0, y0, x1, y1 = box
-    crop = pil.crop((x0, y0, x1, y1))
-    crop = crop.resize((max(1, crop.width * scale), max(1, crop.height * scale)),
-                       Image.Resampling.LANCZOS)
-    data = pytesseract.image_to_data(
-        crop, lang=lang, config=config, output_type=pytesseract.Output.DICT
-    )
-    out = []
-    for i, raw_word in enumerate(data["text"]):
-        word = str(raw_word).strip()
-        try:
-            conf = float(data["conf"][i])
-        except (TypeError, ValueError):
-            conf = -1
-        if not word or conf < 10:
-            continue
-        top = y0 + float(data["top"][i]) / scale
-        height = float(data["height"][i]) / scale
-        left = x0 + float(data["left"][i]) / scale
-        width = float(data["width"][i]) / scale
-        out.append({
-            "text": word, "cy": top + height / 2,
-            "cx": left + width / 2, "conf": conf
-        })
-    return out
-
-
 def parse_target_image(raw):
-    """
-    Đọc ảnh Lũy kế dạng bảng điện thoại mới:
-    - Cột chương trình
-    - THỰC HIỆN
-    - TARGET
-    - Các cột % phía bên phải chỉ dùng để nhận diện bố cục, không dùng tính doanh số.
-    Mỗi dòng được neo theo tọa độ OCR của cột THỰC HIỆN để tránh lệch cột/lệch dòng.
-    """
     bgr = image_bytes_to_bgr(raw)
-    pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
     h, w = bgr.shape[:2]
-
-    # Ảnh bảng điện thoại: cột cố định theo tỷ lệ chiều rộng, không dùng lưới của Excel tháng 10.
-    if h / max(w, 1) >= 2.0 and w >= 400:
-        y_top, y_bottom = int(h * 0.185), int(h * 0.992)
-        name_right = int(w * 0.372)
-        actual_right = int(w * 0.536)
-        target_right = int(w * 0.698)
-
-        actual_words = _ocr_words_in_crop(
-            pil, (int(w * 0.372), y_top, actual_right, y_bottom),
-            lang="eng", config="--psm 6 -c tessedit_char_whitelist=0123456789,.-"
-        )
-        target_words = _ocr_words_in_crop(
-            pil, (actual_right, y_top, target_right, y_bottom),
-            lang="eng", config="--psm 6 -c tessedit_char_whitelist=0123456789,.-"
-        )
-        name_words = _ocr_words_in_crop(
-            pil, (0, y_top, name_right, y_bottom),
-            lang="vie+eng", config="--psm 6"
-        )
-
-        # Một token số THỰC HIỆN là mốc của một dòng dữ liệu.
-        anchors = []
-        for token in actual_words:
-            value = parse_numeric(token["text"])
-            if value is not None:
-                anchors.append((token["cy"], value, token["text"], token["conf"]))
-        anchors.sort(key=lambda x: x[0])
-
-        # Gộp token cùng một dòng nếu OCR tách một số thành nhiều mảnh.
-        merged = []
-        for item in anchors:
-            if merged and abs(item[0] - merged[-1][0]) < 10:
-                # Giữ token có độ tin cậy cao hơn, tránh tự ghép hai con số.
-                if item[3] > merged[-1][3]:
-                    merged[-1] = item
-            else:
-                merged.append(item)
-        anchors = merged
-
-        if len(anchors) != 39:
-            raise ValueError(
-                f"Ảnh Lũy kế phải có 39 chương trình nhưng OCR chỉ nhận diện {len(anchors)} giá trị THỰC HIỆN. "
-                "V8 dừng tại đây, không tự bù hoặc bỏ dòng. Hãy kiểm tra ảnh Drive đã thay đúng ảnh mới chưa."
-            )
-
-        records = []
-        for idx, (cy, actual, actual_raw, actual_conf) in enumerate(anchors):
-            prev_mid = ((anchors[idx - 1][0] + cy) / 2) if idx else cy - 24
-            next_mid = ((cy + anchors[idx + 1][0]) / 2) if idx + 1 < len(anchors) else cy + 24
-
-            # OCR tên riêng trong đúng vùng dòng; tốt hơn ghép token toàn ảnh khi tên xuống 2 dòng.
-            row_crop = pil.crop((
-                int(w * 0.065), max(0, int(prev_mid)),
-                name_right, min(h, int(next_mid))
-            ))
-            row_crop = row_crop.resize((
-                max(1, row_crop.width * 3), max(1, row_crop.height * 3)
-            ), Image.Resampling.LANCZOS)
-            label_text = pytesseract.image_to_string(
-                row_crop, lang="vie+eng", config="--psm 6"
-            )
-            label = re.sub(r"\s+", " ", label_text).strip()
-            label = re.sub(r"^(?:[+*#©®|]+\s*)+", "", label)
-            label = re.sub(r"\b(?:DT|SL|ICT|DV|or|opr|st|si|srL)\b", "", label, flags=re.I)
-            label = re.sub(r"\s+", " ", label).strip(" -|+")
-
-            # TARGET chỉ lấy token nằm đúng vùng cột TARGET và đúng dải Y của dòng.
-            row_target = [
-                t for t in target_words
-                if prev_mid <= t["cy"] < next_mid
-                and parse_numeric(t["text"]) is not None
-            ]
-            row_target.sort(key=lambda t: (abs(t["cy"] - cy), -t["conf"]))
-            target = parse_numeric(row_target[0]["text"]) if row_target else None
-            target_raw = row_target[0]["text"] if row_target else ""
-
-            # Nhóm Đồng hồ & Smartwatch trong ảnh không có TARGET.
-            is_smartwatch = "smartwatch" in norm(label)
-            if is_smartwatch:
-                target = None
-                target_raw = "Không có TARGET trên ảnh"
-
-            status_parts = []
-            if not label:
-                status_parts.append("Cần kiểm tra tên nhóm")
-            if not is_smartwatch and target is None:
-                status_parts.append("Cần kiểm tra TARGET")
-            if actual_conf < 35:
-                status_parts.append("OCR THỰC HIỆN độ tin cậy thấp")
-            if not status_parts:
-                status_parts.append("Đã đọc — cần đối chiếu")
-            records.append({
-                "STT": idx + 1,
-                "Nhóm hàng": label,
-                "THỰC HIỆN": actual,
-                "TARGET siêu thị": target,
-                "OCR tên": label,
-                "OCR số": f"THỰC HIỆN={actual_raw}; TARGET={target_raw}",
-                "Trạng thái": "; ".join(status_parts)
-            })
-
-        return pd.DataFrame(records)
-
-    # Không dùng ảnh bảng Excel cũ làm nguồn tháng 11 vì ảnh đó không có cột THỰC HIỆN.
-    # Nếu ảnh không phải màn hình điện thoại mới, báo rõ để người dùng thay đúng ảnh.
-    raise ValueError(
-        f"Ảnh Lũy kế '{w}×{h}' không đúng định dạng mới. Hãy thay bằng ảnh chụp màn hình điện thoại "
-        "có đủ cột CHƯƠNG TRÌNH, THỰC HIỆN, TARGET, % HT. Không dùng ảnh bảng Excel tháng 10."
-    )
     row_lines, group_x, target_x = find_target_table_geometry(bgr)
     records = []
     for i in range(len(row_lines) - 1):
         y0, y1 = row_lines[i], row_lines[i + 1]
+        # Use the whole row height and crop away vertical borders.
         name_crop = pil.crop((group_x[0] + 3, y0 + 3, group_x[1] - 3, y1 - 3))
         name_crop = name_crop.resize((name_crop.width * 2, name_crop.height * 2))
         name_text = pytesseract.image_to_string(name_crop, lang="vie+eng", config="--psm 6")
@@ -355,10 +199,12 @@ def parse_target_image(raw):
         )
         target = parse_numeric(target_text)
         records.append({
-            "STT": i + 1, "Nhóm hàng": name, "THỰC HIỆN": None,
-            "TARGET siêu thị": target, "OCR tên": name,
-            "OCR số": f"TARGET={target_text.strip()}",
-            "Trạng thái": "Cần kiểm tra THỰC HIỆN — ảnh không đúng định dạng mới"
+            "STT": i + 1,
+            "Nhóm hàng": name,
+            "TARGET siêu thị": target,
+            "OCR tên": name,
+            "OCR TARGET": target_text.strip(),
+            "Trạng thái": "Đã đọc" if name and target is not None else "Cần kiểm tra"
         })
     return pd.DataFrame(records)
 
@@ -738,8 +584,8 @@ with st.sidebar:
     st.markdown("### CẤU HÌNH BÁO CÁO")
     report_date = st.text_input("Ngày báo cáo", "09/11/2026")
     staff_count = st.number_input("Số nhân viên", min_value=1, max_value=100, value=9, step=1)
-    st.caption("Doanh số từng NV = THỰC HIỆN cửa hàng × tỷ lệ Dashboard của NV / tổng tỷ lệ 9 NV.")
-    st.caption("Tổng doanh số 9 NV theo từng nhóm phải khớp THỰC HIỆN cửa hàng. Không dùng hệ số 110%.")
+    st.caption("Mục tiêu cá nhân = TARGET siêu thị / số nhân viên.")
+    st.caption("Doanh số quy đổi = mục tiêu cá nhân × tỷ lệ Dashboard / 100. Không áp dụng hệ số 110%.")
 
 for key, default in [
     ("image_items", []), ("parsed_target", None), ("dashboard_results", None),
@@ -810,7 +656,7 @@ with tabs[0]:
 
 with tabs[1]:
     st.markdown("### Phân tích ảnh Lũy kế và 9 Dashboard")
-    st.info("Tên nhóm, THỰC HIỆN và TARGET lấy từ ảnh Lũy kế tháng 11. Tỷ lệ lấy từ Dashboard. Doanh số 9 NV được phân bổ theo tỷ trọng tỷ lệ và tổng từng nhóm khớp THỰC HIỆN cửa hàng.")
+    st.info("Tên nhóm và TARGET đọc từ từng dòng của ảnh Lũy kế. Tỷ lệ đọc từ từng thẻ trắng trong phần THI ĐUA. File Excel tháng 10 không được sử dụng.")
     if st.button("▶ PHÂN TÍCH 10 ẢNH", type="primary", disabled=not st.session_state.image_items):
         target_images, employee_files, missing_codes, duplicate_codes, other_files = identify_sources(st.session_state.image_items)
         if not target_images:
@@ -871,8 +717,8 @@ with tabs[2]:
     if st.session_state.parsed_target is None or st.session_state.dashboard_results is None:
         st.info("Chạy phân tích ảnh ở tab ② trước.")
     else:
-        st.markdown("### A. Rà soát danh mục, THỰC HIỆN và TARGET từ ảnh Lũy kế")
-        st.caption("Anh có thể sửa tên nhóm, THỰC HIỆN hoặc TARGET nếu OCR đọc chưa đúng. Thứ tự dòng được giữ nguyên.")
+        st.markdown("### A. Rà soát danh mục và TARGET từ ảnh Lũy kế")
+        st.caption("Anh có thể sửa tên nhóm hoặc TARGET nếu OCR đọc chưa đúng. Thứ tự dòng được giữ nguyên.")
         target_input = st.data_editor(
             st.session_state.target_editor,
             use_container_width=True,
@@ -882,10 +728,9 @@ with tabs[2]:
             column_config={
                 "STT": st.column_config.NumberColumn("STT", disabled=True),
                 "Nhóm hàng": st.column_config.TextColumn("Tên nhóm hàng", required=True),
-                "THỰC HIỆN": st.column_config.NumberColumn("THỰC HIỆN cửa hàng", format="%.2f", required=True),
-                "TARGET siêu thị": st.column_config.NumberColumn("TARGET siêu thị", format="%.2f", required=False),
+                "TARGET siêu thị": st.column_config.NumberColumn("TARGET siêu thị", format="%.2f", required=True),
                 "OCR tên": st.column_config.TextColumn("OCR gốc", disabled=True),
-                "OCR số": st.column_config.TextColumn("OCR số gốc", disabled=True),
+                "OCR TARGET": st.column_config.TextColumn("OCR TARGET gốc", disabled=True),
                 "Trạng thái": st.column_config.TextColumn(disabled=True)
             }
         )
@@ -893,15 +738,15 @@ with tabs[2]:
         group_names = target_input["Nhóm hàng"].astype(str).tolist()
         if len(set(norm(x) for x in group_names)) != len(group_names):
             st.error("Tên nhóm hàng bị trùng sau khi chuẩn hóa. Hãy sửa tên trước khi tạo ma trận.")
-        if target_input["THỰC HIỆN"].isna().any() or not all(str(x).strip() for x in group_names):
+        if target_input["TARGET siêu thị"].isna().any() or not all(str(x).strip() for x in group_names):
             st.warning("Còn tên nhóm hoặc TARGET chưa đọc được. Hãy sửa các ô trống trước khi tạo ma trận.")
 
         st.divider()
         st.markdown("### B. Tạo ma trận tỷ lệ 9 nhân viên × nhóm hàng")
         st.caption("Tỷ lệ từ thẻ được giữ nguyên, 0 chỉ lấy từ danh sách 'Chưa có số liệu'. Ô không đọc được để trống.")
         if st.button("TẠO / CẬP NHẬT MA TRẬN", type="primary"):
-            if target_input["THỰC HIỆN"].isna().any() or not all(str(x).strip() for x in group_names):
-                st.error("Hãy hoàn tất tên nhóm và THỰC HIỆN trước. TARGET có thể để trống nếu ảnh ghi không có target.")
+            if target_input["TARGET siêu thị"].isna().any() or not all(str(x).strip() for x in group_names):
+                st.error("Hãy hoàn tất danh mục và TARGET trước.")
             elif len(set(norm(x) for x in group_names)) != len(group_names):
                 st.error("Tên nhóm hàng bị trùng.")
             else:
@@ -953,25 +798,16 @@ with tabs[3]:
     else:
         groups = st.session_state.target_editor["Nhóm hàng"].astype(str).tolist()
         targets = pd.to_numeric(st.session_state.target_editor["TARGET siêu thị"], errors="coerce")
-        actuals = pd.to_numeric(st.session_state.target_editor["THỰC HIỆN"], errors="coerce")
         rates = st.session_state.matrix_editor.copy()
         missing_rates = int(rates[groups].isna().sum().sum())
-        missing_targets = int(actuals.isna().sum())
+        missing_targets = int(targets.isna().sum())
         if missing_rates or missing_targets:
             st.warning(f"Còn {missing_rates} ô tỷ lệ và {missing_targets} TARGET chưa xác minh. Bảng sẽ giữ trống các ô chưa đủ dữ liệu.")
+        individual_targets = targets / int(staff_count)
         sales = rates.copy()
         for j, group in enumerate(groups):
-            weights = pd.to_numeric(rates[group], errors="coerce")
-            weight_total = weights.sum(min_count=staff_count)
-            if pd.isna(actuals.iloc[j]) or pd.isna(weight_total):
-                sales[group] = np.nan
-            elif weight_total <= 0 and abs(float(actuals.iloc[j])) < 1e-12:
-                sales[group] = 0.0
-            elif weight_total <= 0:
-                sales[group] = np.nan
-            else:
-                sales[group] = actuals.iloc[j] * weights / weight_total
-        st.markdown("### Bảng doanh số phân bổ — tổng 9 nhân viên khớp THỰC HIỆN cửa hàng")
+            sales[group] = individual_targets.iloc[j] * pd.to_numeric(rates[group], errors="coerce") / 100
+        st.markdown("### Bảng xem trước doanh số — theo mẫu đã chốt")
         preview = sales.copy()
         total = {"Nhân viên": "TỔNG"}
         for group in groups:
@@ -992,23 +828,6 @@ with tabs[3]:
             ])
             .format({g:"{:,.2f}" for g in groups}, na_rep=""))
         st.dataframe(styled, use_container_width=True, height=540, hide_index=True)
-
-        # Reconciliation check: sum of employee allocations must equal store actual for each group.
-        recon = []
-        for j, group in enumerate(groups):
-            ssum = pd.to_numeric(sales[group], errors="coerce").sum(min_count=staff_count)
-            store_actual = actuals.iloc[j]
-            recon.append({"Nhóm hàng": group, "THỰC HIỆN cửa hàng": store_actual,
-                          "Tổng 9 NV": ssum,
-                          "Chênh lệch": (ssum - store_actual) if pd.notna(ssum) and pd.notna(store_actual) else np.nan})
-        recon_df = pd.DataFrame(recon)
-        with st.expander("Đối soát tổng doanh số 9 NV với THỰC HIỆN cửa hàng"):
-            st.dataframe(recon_df, use_container_width=True, hide_index=True)
-            diffs = pd.to_numeric(recon_df["Chênh lệch"], errors="coerce").dropna().abs()
-            if len(diffs) == len(groups) and (diffs < 0.000001).all():
-                st.success("Đã đối soát: tổng doanh số 9 NV khớp THỰC HIỆN cửa hàng ở tất cả nhóm.")
-            else:
-                st.warning("Còn nhóm chưa đủ tỷ lệ hoặc chưa khớp tổng THỰC HIỆN. Chưa nên chốt báo cáo.")
 
         st.markdown("### Tình trạng xác minh")
         c1, c2, c3 = st.columns(3)
