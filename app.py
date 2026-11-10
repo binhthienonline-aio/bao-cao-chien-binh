@@ -25,7 +25,7 @@ div.stButton>button,div.stDownloadButton>button{border-radius:8px;font-weight:65
 </style>
 """, unsafe_allow_html=True)
 st.markdown(
-    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5.2 LŨY KẾ ONLY</h1>'
+    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5.3 LŨY KẾ HEADER FIX</h1>'
     '<p>Chỉ đọc ảnh tháng 11 • Lũy kế là doanh số gốc • Dashboard là tỷ lệ phân bổ • Xuất Excel và PNG theo mẫu</p></div>',
     unsafe_allow_html=True
 )
@@ -150,50 +150,82 @@ def _norm_ocr_token(value):
     return "".join(ch for ch in value if unicodedata.category(ch) != "Mn" and ch.isalnum())
 
 def detect_luyke_column_from_header(bgr):
-    """Locate the LŨY KẾ column from its own header; never infer it from TARGET position."""
+    """Locate the actual LŨY KẾ header cell in the colored table-header band.
+
+    Do not OCR the green report title: it also contains the words 'LŨY KẾ'.
+    Instead isolate the blue column-header band, enlarge it, and use the
+    horizontal positions of LŨY KẾ, MỤC TIÊU and TARGET to bound the column.
+    """
     h, w = bgr.shape[:2]
-    header_img = bgr[:int(h * 0.68), :]
+    b, g, r = cv2.split(bgr)
+    # The source report uses a blue header row; the green title row is excluded.
+    blue = (b > 65) & (b > g * 1.12) & (b > r * 1.12) & (r < 175)
+    row_counts = blue.sum(axis=1)
+    active_rows = np.where(row_counts > max(3, int(w * 0.12)))[0]
+    if len(active_rows) == 0:
+        raise ValueError("Không tìm thấy dải tiêu đề màu xanh của bảng Lũy kế.")
+    # Pick the strongest compact horizontal band, avoiding scattered blue pixels.
+    runs = _runs(np.isin(np.arange(h), active_rows))
+    bands = [(a, z) for a, z, length in runs if length >= 3]
+    if not bands:
+        raise ValueError("Không xác định được hàng tiêu đề cột Lũy kế.")
+    y0, y1 = max(bands, key=lambda band: row_counts[band[0]:band[1] + 1].sum())
+    y0, y1 = max(0, y0 - 1), min(h, y1 + 2)
+
+    scale = max(4, min(10, int(1800 / max(1, w))))
+    header = cv2.resize(bgr[y0:y1, :], None, fx=scale, fy=scale,
+                        interpolation=cv2.INTER_CUBIC)
     data = pytesseract.image_to_data(
-        header_img, lang="vie+eng", config="--psm 11",
+        header, lang="vie+eng", config="--psm 6",
         output_type=pytesseract.Output.DICT
     )
-    lines = {}
+    words = []
     for i, raw in enumerate(data.get("text", [])):
         token = _norm_ocr_token(raw)
         if not token:
             continue
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        x = data["left"][i] + data["width"][i] / 2
-        y = data["top"][i] + data["height"][i] / 2
-        lines.setdefault(key, []).append((token, x, y))
+        cx = (data["left"][i] + data["width"][i] / 2) / scale
+        cy = (data["top"][i] + data["height"][i] / 2) / scale + y0
+        words.append((token, cx, cy))
 
+    # Common OCR variants include LUYKE, LUYKEE, LUY + KE, and LOY + KE.
+    luy_candidates = [(t, x) for t, x, _ in words
+                      if "LUYKE" in t or "LUYKEE" in t or "UYKE" in t]
+    if not luy_candidates:
+        luy_words = [(t, x, y) for t, x, y in words
+                     if t.startswith(("LUY", "LOY"))]
+        ke_words = [(t, x, y) for t, x, y in words if t.startswith("KE")]
+        for lt, lx, ly in luy_words:
+            nearby = [(abs(kx - lx), kx) for kt, kx, ky in ke_words
+                      if abs(ky - ly) <= max(8, (y1 - y0) * 0.45)
+                      and 0 <= kx - lx <= w * 0.12]
+            if nearby:
+                _, kx = min(nearby)
+                luy_candidates.append(("LUYKE", (lx + kx) / 2))
+    target_words = [(t, x) for t, x, _ in words if t.startswith("TARGET")]
+    prev_words = [(t, x) for t, x, _ in words
+                  if t.startswith(("MUC", "TIEU", "MUCTIEU"))]
+
+    if not luy_candidates or not target_words or not prev_words:
+        raise ValueError(
+            "Không nhận diện chắc chắn ô tiêu đề LŨY KẾ trong hàng tiêu đề màu xanh. "
+            "Ứng dụng đã dừng để tránh lấy nhầm TARGET."
+        )
+
+    # Select the LŨY KẾ token lying between MỤC TIÊU and TARGET.
     candidates = []
-    for words in lines.values():
-        tokens = [x[0] for x in words]
-        # The correct header row contains LŨY KẾ, MỤC TIÊU and TARGET together.
-        has_luy = any(t.startswith("LUY") for t in tokens)
-        has_ke = any(t.startswith("KE") for t in tokens)
-        has_target = any(t.startswith("TARGET") for t in tokens)
-        has_muctieu = any(t.startswith("MUC") for t in tokens) or any(t.startswith("TIEU") for t in tokens)
-        if has_luy and has_ke and has_target and has_muctieu:
-            def center(prefix):
-                vals = [x for t, x, _ in words if t.startswith(prefix)]
-                return sum(vals) / len(vals) if vals else None
-            luy = center("LUY")
-            ke = center("KE")
-            target = center("TARGET")
-            muc = center("MUC")
-            tieu = center("TIEU")
-            prev = [v for v in (muc, tieu) if v is not None and v < luy]
-            if luy is not None and ke is not None and target is not None and prev:
-                luy_center = (luy + ke) / 2
-                candidates.append((abs(sum(x[2] for x in words) / len(words) - h * 0.42),
-                                   (max(0, int((max(prev) + luy_center) / 2)),
-                                    min(w, int((luy_center + target) / 2)))))
+    for _, lx in luy_candidates:
+        prev = [x for _, x in prev_words if x < lx]
+        nxt = [x for _, x in target_words if x > lx]
+        if prev and nxt:
+            px, tx = max(prev), min(nxt)
+            if px < lx < tx:
+                candidates.append((abs((lx - px) - (tx - lx)), px, lx, tx))
     if not candidates:
-        raise ValueError("Không nhận diện chắc chắn tiêu đề cột LŨY KẾ. Ứng dụng đã dừng để tránh lấy nhầm TARGET.")
-    candidates.sort(key=lambda x: x[0])
-    x0, x1 = candidates[0][1]
+        raise ValueError("Đã thấy chữ LŨY KẾ nhưng không xác định được ranh giới cột an toàn.")
+    _, px, lx, tx = min(candidates)
+    x0 = max(0, int(round((px + lx) / 2)))
+    x1 = min(w, int(round((lx + tx) / 2)))
     if x1 - x0 < w * 0.025:
         raise ValueError("Không xác định được bề rộng cột LŨY KẾ. Vui lòng dùng ảnh rõ tiêu đề.")
     return (x0, x1)
@@ -232,7 +264,7 @@ def find_target_table_geometry(bgr):
     # separators are faint/missing in the screenshot; infer them from the
     # stable row pitch. This yields all 38 data rows in the supplied image.
     base_pitch = float(np.median(np.diff(best_seq)))
-    row_lines = [int(best_seq[0] - base_pitch)]
+    row_lines = [int(best_seq[0] - 2 * base_pitch)]
     for y in best_seq:
         gap = y - row_lines[-1]
         if gap > 1.5 * base_pitch:
@@ -241,6 +273,9 @@ def find_target_table_geometry(bgr):
             for k in range(1, parts):
                 row_lines.append(int(round(prev + gap * k / parts)))
         row_lines.append(int(y))
+    # Include the final data-row boundary when the mobile screenshot clips its faint bottom rule.
+    if row_lines:
+        row_lines.append(int(min(h - 1, round(row_lines[-1] + base_pitch))))
 
     # Detect vertical separators across the data body.
     y0, y1 = row_lines[0], row_lines[-1]
