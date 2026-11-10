@@ -25,8 +25,8 @@ div.stButton>button,div.stDownloadButton>button{border-radius:8px;font-weight:65
 </style>
 """, unsafe_allow_html=True)
 st.markdown(
-    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V6</h1>'
-    '<p>Chỉ đọc ảnh tháng 11 • Lũy kế lấy THỰC HIỆN + TARGET • Phân bổ doanh số theo tỷ trọng Dashboard</p></div>',
+    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V7</h1>'
+    '<p>Chỉ đọc ảnh tháng 11 • Lũy kế đọc riêng THỰC HIỆN + TARGET • Phân bổ theo tỷ trọng Dashboard</p></div>',
     unsafe_allow_html=True
 )
 
@@ -178,77 +178,173 @@ def find_target_table_geometry(bgr):
         target_x = (int(w * 0.688), int(w * 0.778))
     return best_seq, group_x, target_x
 
-def parse_target_image(raw):
-    """Đọc ảnh Lũy kế dạng màn hình điện thoại bằng vị trí cột và dòng OCR."""
-    bgr = image_bytes_to_bgr(raw)
-    pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-    scale = 3
-    up = pil.resize((pil.width * scale, pil.height * scale), Image.Resampling.LANCZOS)
-    data = pytesseract.image_to_data(up, lang="vie+eng", config="--psm 11", output_type=pytesseract.Output.DICT)
-    words = []
+
+def _ocr_words_in_crop(pil, box, lang="eng", config="--psm 6", scale=3):
+    """OCR từ một cột riêng; trả về token cùng tọa độ Y trên ảnh gốc."""
+    x0, y0, x1, y1 = box
+    crop = pil.crop((x0, y0, x1, y1))
+    crop = crop.resize((max(1, crop.width * scale), max(1, crop.height * scale)),
+                       Image.Resampling.LANCZOS)
+    data = pytesseract.image_to_data(
+        crop, lang=lang, config=config, output_type=pytesseract.Output.DICT
+    )
+    out = []
     for i, raw_word in enumerate(data["text"]):
         word = str(raw_word).strip()
-        if not word or int(data["conf"][i]) < 5:
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1
+        if not word or conf < 10:
             continue
-        x, y = int(data["left"][i]), int(data["top"][i])
-        words.append({"text": word, "x": x, "y": y, "cx": x + int(data["width"][i]) / 2})
+        top = y0 + float(data["top"][i]) / scale
+        height = float(data["height"][i]) / scale
+        left = x0 + float(data["left"][i]) / scale
+        width = float(data["width"][i]) / scale
+        out.append({
+            "text": word, "cy": top + height / 2,
+            "cx": left + width / 2, "conf": conf
+        })
+    return out
 
-    # Detect one table row from the two percentage columns at the right.
-    pct_words = [w for w in words if "%" in w["text"] and w["x"] > 1080 and w["y"] > 1000]
-    centers = []
-    for w in sorted(pct_words, key=lambda z: z["y"]):
-        if not centers or abs(w["y"] - centers[-1]) > 38:
-            centers.append(w["y"])
-        else:
-            centers[-1] = int((centers[-1] + w["y"]) / 2)
-    # Restrict to the actual program table, excluding header/menu percentages.
-    centers = [y for y in centers if y > 1100]
+
+def parse_target_image(raw):
+    """
+    Đọc ảnh Lũy kế dạng bảng điện thoại mới:
+    - Cột chương trình
+    - THỰC HIỆN
+    - TARGET
+    - Các cột % phía bên phải chỉ dùng để nhận diện bố cục, không dùng tính doanh số.
+    Mỗi dòng được neo theo tọa độ OCR của cột THỰC HIỆN để tránh lệch cột/lệch dòng.
+    """
+    bgr = image_bytes_to_bgr(raw)
+    pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    h, w = bgr.shape[:2]
+
+    # Ảnh bảng điện thoại: cột cố định theo tỷ lệ chiều rộng, không dùng lưới của Excel tháng 10.
+    if h / max(w, 1) >= 1.8 and w >= 400:
+        y_top, y_bottom = int(h * 0.185), int(h * 0.992)
+        name_right = int(w * 0.372)
+        actual_right = int(w * 0.536)
+        target_right = int(w * 0.698)
+
+        actual_words = _ocr_words_in_crop(
+            pil, (int(w * 0.372), y_top, actual_right, y_bottom),
+            lang="eng", config="--psm 6 -c tessedit_char_whitelist=0123456789,.-"
+        )
+        target_words = _ocr_words_in_crop(
+            pil, (actual_right, y_top, target_right, y_bottom),
+            lang="eng", config="--psm 6 -c tessedit_char_whitelist=0123456789,.-"
+        )
+        name_words = _ocr_words_in_crop(
+            pil, (0, y_top, name_right, y_bottom),
+            lang="vie+eng", config="--psm 6"
+        )
+
+        # Một token số THỰC HIỆN là mốc của một dòng dữ liệu.
+        anchors = []
+        for token in actual_words:
+            value = parse_numeric(token["text"])
+            if value is not None:
+                anchors.append((token["cy"], value, token["text"], token["conf"]))
+        anchors.sort(key=lambda x: x[0])
+
+        # Gộp token cùng một dòng nếu OCR tách một số thành nhiều mảnh.
+        merged = []
+        for item in anchors:
+            if merged and abs(item[0] - merged[-1][0]) < 10:
+                # Giữ token có độ tin cậy cao hơn, tránh tự ghép hai con số.
+                if item[3] > merged[-1][3]:
+                    merged[-1] = item
+            else:
+                merged.append(item)
+        anchors = merged
+
+        if len(anchors) < 30:
+            raise ValueError(
+                f"Chỉ nhận diện được {len(anchors)} dòng THỰC HIỆN từ ảnh điện thoại. "
+                "Không tạo dữ liệu tự suy đoán; hãy dùng ảnh rõ hơn hoặc nhập thủ công."
+            )
+
+        records = []
+        for idx, (cy, actual, actual_raw, actual_conf) in enumerate(anchors):
+            prev_mid = ((anchors[idx - 1][0] + cy) / 2) if idx else cy - 24
+            next_mid = ((cy + anchors[idx + 1][0]) / 2) if idx + 1 < len(anchors) else cy + 24
+
+            # OCR tên riêng trong đúng vùng dòng; tốt hơn ghép token toàn ảnh khi tên xuống 2 dòng.
+            row_crop = pil.crop((
+                int(w * 0.065), max(0, int(prev_mid)),
+                name_right, min(h, int(next_mid))
+            ))
+            row_crop = row_crop.resize((
+                max(1, row_crop.width * 3), max(1, row_crop.height * 3)
+            ), Image.Resampling.LANCZOS)
+            label_text = pytesseract.image_to_string(
+                row_crop, lang="vie+eng", config="--psm 11"
+            )
+            label = re.sub(r"\\s+", " ", label_text).strip()
+            label = re.sub(r"^(?:[+*#©®|]+\\s*)+", "", label)
+            label = re.sub(r"\\b(?:DT|SL|ICT|DV|or|opr|st|si|srL)\\b", "", label, flags=re.I)
+            label = re.sub(r"\\s+", " ", label).strip(" -|+")
+
+            # TARGET chỉ lấy token nằm đúng vùng cột TARGET và đúng dải Y của dòng.
+            row_target = [
+                t for t in target_words
+                if prev_mid <= t["cy"] < next_mid
+                and parse_numeric(t["text"]) is not None
+            ]
+            row_target.sort(key=lambda t: (abs(t["cy"] - cy), -t["conf"]))
+            target = parse_numeric(row_target[0]["text"]) if row_target else None
+            target_raw = row_target[0]["text"] if row_target else ""
+
+            # Nhóm Đồng hồ & Smartwatch trong ảnh không có TARGET.
+            is_smartwatch = "smartwatch" in norm(label)
+            if is_smartwatch:
+                target = None
+                target_raw = "Không có TARGET trên ảnh"
+
+            status_parts = []
+            if not label:
+                status_parts.append("Cần kiểm tra tên nhóm")
+            if not is_smartwatch and target is None:
+                status_parts.append("Cần kiểm tra TARGET")
+            if actual_conf < 35:
+                status_parts.append("OCR THỰC HIỆN độ tin cậy thấp")
+            if not status_parts:
+                status_parts.append("Đã đọc — cần đối chiếu")
+            records.append({
+                "STT": idx + 1,
+                "Nhóm hàng": label,
+                "THỰC HIỆN": actual,
+                "TARGET siêu thị": target,
+                "OCR tên": label,
+                "OCR số": f"THỰC HIỆN={actual_raw}; TARGET={target_raw}",
+                "Trạng thái": "; ".join(status_parts)
+            })
+
+        return pd.DataFrame(records)
+
+    # Fallback cho ảnh bảng dạng Excel cũ: giữ nguyên cơ chế cũ, nhưng chỉ đọc TARGET.
+    row_lines, group_x, target_x = find_target_table_geometry(bgr)
     records = []
-    for idx, cy in enumerate(centers):
-        prev_mid = (centers[idx - 1] + cy) / 2 if idx else cy - 85
-        next_mid = (cy + centers[idx + 1]) / 2 if idx + 1 < len(centers) else cy + 85
-        row_words = [w for w in words if prev_mid <= w["y"] < next_mid]
-        # Category text lives in the left column; strip UI badges and leading symbols.
-        label_words = [w for w in row_words if w["cx"] < 590 and not re.fullmatch(r"[+*#©®|]+", w["text"])]
-        label = " ".join(w["text"] for w in sorted(label_words, key=lambda z: (z["y"], z["x"])))
-        label = re.sub(r"^(?:[+*#©®|]+\s*)+", "", label).strip()
-        label = re.sub(r"\b(?:DT|SL|CE|ICT|DV|or|st|si)\b", "", label, flags=re.I)
-        label = re.sub(r"\s+", " ", label).strip(" -|+")
-        # Numeric columns are identified by x-coordinate in the enlarged screenshot.
-        numeric = []
-        for w in row_words:
-            if 590 <= w["cx"] < 900 or 900 <= w["cx"] < 1135:
-                val = parse_numeric(w["text"])
-                if val is not None:
-                    numeric.append((w["cx"], val, w["text"]))
-        actual_candidates = [v for x, v, t in numeric if x < 900]
-        target_candidates = [v for x, v, t in numeric if x >= 900]
-        actual = actual_candidates[0] if actual_candidates else None
-        target = target_candidates[0] if target_candidates else None
-        # OCR can place a wrapped name in the previous visual line; retain a visible placeholder for review.
-        if label:
-            records.append({"STT": len(records)+1, "Nhóm hàng": label, "THỰC HIỆN": actual,
-                            "TARGET siêu thị": target, "OCR tên": label,
-                            "OCR số": f"THỰC HIỆN={actual}; TARGET={target}",
-                            "Trạng thái": "Đã đọc — cần đối chiếu" if actual is not None else "Cần kiểm tra THỰC HIỆN"})
-
-    # The final Smartwatch program has no target and no completion percentage.
-    smartwatch = [w for w in words if "smartwatch" in norm(w["text"])]
-    if smartwatch:
-        sy = max(w["y"] for w in smartwatch)
-        srow = [w for w in words if abs(w["y"] - sy) < 100 and 590 <= w["cx"] < 900]
-        vals = [parse_numeric(w["text"]) for w in srow]
-        vals = [v for v in vals if v is not None]
-        actual = vals[0] if vals else None
-        records.append({"STT": len(records)+1, "Nhóm hàng": "Đồng hồ & Smartwatch", "THỰC HIỆN": actual,
-                        "TARGET siêu thị": None, "OCR tên": "Đồng hồ & Smartwatch",
-                        "OCR số": f"THỰC HIỆN={actual}; TARGET=không có",
-                        "Trạng thái": "Không có TARGET trên ảnh" if actual is not None else "Cần kiểm tra THỰC HIỆN"})
-
-    if len(records) < 30:
-        raise ValueError(f"Ảnh Lũy kế mới chỉ nhận diện được {len(records)} dòng. Hãy dùng ảnh rõ hơn hoặc nhập lại danh mục.")
-    for i, record in enumerate(records, 1):
-        record["STT"] = i
+    for i in range(len(row_lines) - 1):
+        y0, y1 = row_lines[i], row_lines[i + 1]
+        name_crop = pil.crop((group_x[0] + 3, y0 + 3, group_x[1] - 3, y1 - 3))
+        name_crop = name_crop.resize((name_crop.width * 2, name_crop.height * 2))
+        name_text = pytesseract.image_to_string(name_crop, lang="vie+eng", config="--psm 6")
+        name = re.sub(r"\s+", " ", name_text).strip(" \n\t-:")
+        target_crop = pil.crop((target_x[0] + 3, y0 + 3, target_x[1] - 3, y1 - 3))
+        target_text = pytesseract.image_to_string(
+            target_crop, lang="eng",
+            config="--psm 7 -c tessedit_char_whitelist=0123456789,."
+        )
+        target = parse_numeric(target_text)
+        records.append({
+            "STT": i + 1, "Nhóm hàng": name, "THỰC HIỆN": None,
+            "TARGET siêu thị": target, "OCR tên": name,
+            "OCR số": f"TARGET={target_text.strip()}",
+            "Trạng thái": "Cần kiểm tra THỰC HIỆN — ảnh không đúng định dạng mới"
+        })
     return pd.DataFrame(records)
 
 def card_components(bgr):
