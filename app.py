@@ -232,23 +232,56 @@ def card_components(bgr):
 def card_ocr(bgr, box):
     x, y, w, h = box
     H, W = bgr.shape[:2]
+    # Whole card OCR is used for the category label only.
     crop = bgr[max(0, y - 5):min(H, y + h + 5), max(0, x - 5):min(W, x + w + 5)]
-    crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-    text = pytesseract.image_to_string(pil, lang="eng", config="--psm 6")
-    # Retry only when the percent was not recognized.
-    match = re.search(r"(-?\s*\d{1,3})\s*%", text)
-    if not match:
-        text2 = pytesseract.image_to_string(pil, lang="eng", config="--psm 7")
-        if re.search(r"(-?\s*\d{1,3})\s*%", text2):
-            text = text2
-            match = re.search(r"(-?\s*\d{1,3})\s*%", text)
-    pct = float(match.group(1).replace(" ", "")) if match else None
-    label = re.sub(r"-?\s*\d{1,3}\s*%", " ", text)
+    crop_up = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    pil_full = Image.fromarray(cv2.cvtColor(crop_up, cv2.COLOR_BGR2RGB))
+    try:
+        label_text = pytesseract.image_to_string(pil_full, lang="eng", config="--psm 6", timeout=8)
+    except RuntimeError:
+        label_text = ""
+
+    # Isolate the colored percentage glyphs in the top-right corner.
+    # This removes pale grey diagonal watermark strokes that OCR can mistake for +/- or extra digits.
+    ch, cw = crop.shape[:2]
+    num_crop = crop[:max(12, int(ch * 0.54)), int(cw * 0.60):]
+    hsv = cv2.cvtColor(num_crop, cv2.COLOR_BGR2HSV)
+    colored = ((hsv[:, :, 1] > 70) & (hsv[:, :, 2] > 60)).astype(np.uint8) * 255
+    binary = Image.fromarray(255 - colored)
+    numeric_texts = []
+    parsed = []
+    for psm in (7, 10, 6):
+        try:
+            txt = pytesseract.image_to_string(
+                binary, lang="eng",
+                config=f"--psm {psm} -c tessedit_char_whitelist=0123456789%.-",
+                timeout=5
+            ).strip()
+        except RuntimeError:
+            txt = ""
+        numeric_texts.append(txt)
+        match = re.search(r"(-?\s*\d{1,3})\s*%", txt)
+        if match:
+            try:
+                parsed.append(float(re.sub(r"\s+", "", match.group(1))))
+            except ValueError:
+                pass
+    pct = None
+    if parsed:
+        # Prefer consensus across OCR modes; otherwise use the most frequent reading.
+        counts = {}
+        for value in parsed:
+            counts[value] = counts.get(value, 0) + 1
+        pct = sorted(counts.items(), key=lambda x: (x[1], -abs(x[0])))[-1][0]
+        if counts[pct] == 1 and len(parsed) > 1:
+            pct = None  # disagreement -> require manual review
+
+    label = re.sub(r"-?\s*\d{1,3}\s*%", " ", label_text)
     label = re.sub(r"[\n\r]+", " ", label)
     label = re.sub(r"[^A-Za-z0-9À-ỹ/&+ -]", " ", label)
     label = re.sub(r"\s+", " ", label).strip(" -_")
-    return label, pct, text.strip()
+    raw_text = label_text.strip() + " | NUMBER: " + " / ".join(x for x in numeric_texts if x)
+    return label, pct, raw_text
 
 def match_group(card_label, groups):
     c_norm, c_compact = norm(card_label), compact(card_label)
@@ -388,7 +421,7 @@ def parse_dashboard(raw, groups, code, employee_name):
         "zero_raw": zero_raw
     }
 
-def build_excel(groups, targets, sales, report_date, factor, staff, audit_df):
+def build_excel(groups, sales, rates, report_date, factor, staff, audit_df):
     wb = Workbook()
     ws = wb.active
     ws.title = "Báo cáo"
@@ -401,10 +434,10 @@ def build_excel(groups, targets, sales, report_date, factor, staff, audit_df):
     for j, group in enumerate(groups, 2):
         col_vals = pd.to_numeric(sales[group], errors="coerce")
         ws.cell(2, j, float(col_vals.sum()) if col_vals.notna().all() else None)
-    for row_idx in range(len(matrix)):
-        ws.cell(row_idx + 3, 1, matrix.iloc[row_idx]["Nhân viên"])
+    for row_idx in range(len(sales)):
+        ws.cell(row_idx + 3, 1, sales.iloc[row_idx]["Nhân viên"])
         for col_idx, group in enumerate(groups, 2):
-            v = matrix.iloc[row_idx][group]
+            v = sales.iloc[row_idx][group]
             ws.cell(row_idx + 3, col_idx, float(v) if pd.notna(v) else None)
 
     yellow, orange, blue = "FFF200", "FFC000", "DDEBF7"
@@ -806,7 +839,7 @@ with tabs[3]:
 
         audit_df = st.session_state.card_audit if st.session_state.card_audit is not None else pd.DataFrame()
         # Output as draft when blanks remain; blank cells stay blank, never silently become zero.
-        xlsx = build_excel(groups, targets, sales, report_date, factor, staff_count, audit_df)
+        xlsx = build_excel(groups, sales, rates, report_date, factor, staff_count, audit_df)
         png = build_png(groups, sales, report_date)
         a, b = st.columns(2)
         a.download_button(
