@@ -421,7 +421,7 @@ def parse_dashboard(raw, groups, code, employee_name):
         "zero_raw": zero_raw
     }
 
-def build_excel(groups, sales, rates, report_date, factor, staff, audit_df):
+def build_excel(groups, sales, rates, report_date, staff, audit_df):
     wb = Workbook()
     ws = wb.active
     ws.title = "Báo cáo"
@@ -482,7 +482,6 @@ def build_excel(groups, sales, rates, report_date, factor, staff, audit_df):
 
     audit = wb.create_sheet("Kiểm tra OCR")
     audit.append(["Ngày báo cáo", report_date])
-    audit.append(["Hệ số mục tiêu", factor])
     audit.append(["Số nhân viên", staff])
     audit.append(["Số nhóm hàng", n])
     audit.append(["Ô tỷ lệ chưa xác minh", int(rates.isna().sum().sum())])
@@ -584,10 +583,9 @@ def build_png(groups, matrix, report_date):
 with st.sidebar:
     st.markdown("### CẤU HÌNH BÁO CÁO")
     report_date = st.text_input("Ngày báo cáo", "09/11/2026")
-    factor = st.number_input("Hệ số mục tiêu", min_value=0.0, max_value=5.0, value=1.10, step=0.05)
     staff_count = st.number_input("Số nhân viên", min_value=1, max_value=100, value=9, step=1)
-    st.caption("Mục tiêu cá nhân = TARGET siêu thị × hệ số / số nhân viên.")
-    st.caption("Doanh số cá nhân = mục tiêu cá nhân × tỷ lệ hoàn thành / 100.")
+    st.caption("Mục tiêu cá nhân = TARGET siêu thị / số nhân viên.")
+    st.caption("Doanh số quy đổi = mục tiêu cá nhân × tỷ lệ Dashboard / 100. Không áp dụng hệ số 110%.")
 
 for key, default in [
     ("image_items", []), ("parsed_target", None), ("dashboard_results", None),
@@ -805,7 +803,7 @@ with tabs[3]:
         missing_targets = int(targets.isna().sum())
         if missing_rates or missing_targets:
             st.warning(f"Còn {missing_rates} ô tỷ lệ và {missing_targets} TARGET chưa xác minh. Bảng sẽ giữ trống các ô chưa đủ dữ liệu.")
-        individual_targets = targets * float(factor) / int(staff_count)
+        individual_targets = targets / int(staff_count)
         sales = rates.copy()
         for j, group in enumerate(groups):
             sales[group] = individual_targets.iloc[j] * pd.to_numeric(rates[group], errors="coerce") / 100
@@ -839,7 +837,7 @@ with tabs[3]:
 
         audit_df = st.session_state.card_audit if st.session_state.card_audit is not None else pd.DataFrame()
         # Output as draft when blanks remain; blank cells stay blank, never silently become zero.
-        xlsx = build_excel(groups, sales, rates, report_date, factor, staff_count, audit_df)
+        xlsx = build_excel(groups, sales, rates, report_date, staff_count, audit_df)
         png = build_png(groups, sales, report_date)
         a, b = st.columns(2)
         a.download_button(

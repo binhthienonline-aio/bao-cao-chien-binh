@@ -18,3 +18,6 @@ Một ZIP gồm 9 PNG dashboard, tên file có mã nhân viên (ví dụ `suc-kh
 
 ## Lưu ý
 OCR không phải nguồn dữ liệu tuyệt đối. Các ô chưa chắc chắn để trống, có thể sửa trực tiếp ở bước rà soát trước khi dùng báo cáo chính thức.
+
+
+V5 NO110: Đã bỏ hoàn toàn hệ số 110%. Mục tiêu cá nhân = TARGET siêu thị / số nhân viên. Doanh số quy đổi = mục tiêu cá nhân × tỷ lệ Dashboard / 100.
