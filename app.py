@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Báo cáo Chiến Binh V5", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Báo cáo Chiến Binh V8", page_icon="📊", layout="wide")
 st.markdown("""
 <style>
 .block-container{max-width:1600px;padding-top:1.1rem}
@@ -25,7 +25,7 @@ div.stButton>button,div.stDownloadButton>button{border-radius:8px;font-weight:65
 </style>
 """, unsafe_allow_html=True)
 st.markdown(
-    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V7</h1>'
+    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V8</h1>'
     '<p>Chỉ đọc ảnh tháng 11 • Lũy kế đọc riêng THỰC HIỆN + TARGET • Phân bổ theo tỷ trọng Dashboard</p></div>',
     unsafe_allow_html=True
 )
@@ -122,6 +122,16 @@ def identify_sources(images):
             employee_files.setdefault(code, []).append((name, raw))
         else:
             others.append(name)
+    # Nếu Drive còn lưu cả ảnh Lũy kế cũ và mới, ưu tiên ảnh chụp màn hình điện thoại
+    # có tỷ lệ dọc lớn; không lấy ảnh bảng Excel cũ làm nguồn THỰC HIỆN.
+    def target_rank(item):
+        try:
+            img = Image.open(io.BytesIO(item[1]))
+            w, h = img.size
+            return (h / max(w, 1), h * w)
+        except Exception:
+            return (0, 0)
+    target.sort(key=target_rank, reverse=True)
     missing = [c for c, _ in EMPLOYEES if c not in employee_files]
     duplicates = [c for c, v in employee_files.items() if len(v) > 1]
     return target, employee_files, missing, duplicates, others
@@ -222,7 +232,7 @@ def parse_target_image(raw):
     h, w = bgr.shape[:2]
 
     # Ảnh bảng điện thoại: cột cố định theo tỷ lệ chiều rộng, không dùng lưới của Excel tháng 10.
-    if h / max(w, 1) >= 1.8 and w >= 400:
+    if h / max(w, 1) >= 2.0 and w >= 400:
         y_top, y_bottom = int(h * 0.185), int(h * 0.992)
         name_right = int(w * 0.372)
         actual_right = int(w * 0.536)
@@ -260,10 +270,10 @@ def parse_target_image(raw):
                 merged.append(item)
         anchors = merged
 
-        if len(anchors) < 30:
+        if len(anchors) != 39:
             raise ValueError(
-                f"Chỉ nhận diện được {len(anchors)} dòng THỰC HIỆN từ ảnh điện thoại. "
-                "Không tạo dữ liệu tự suy đoán; hãy dùng ảnh rõ hơn hoặc nhập thủ công."
+                f"Ảnh Lũy kế phải có 39 chương trình nhưng OCR chỉ nhận diện {len(anchors)} giá trị THỰC HIỆN. "
+                "V8 dừng tại đây, không tự bù hoặc bỏ dòng. Hãy kiểm tra ảnh Drive đã thay đúng ảnh mới chưa."
             )
 
         records = []
@@ -280,12 +290,12 @@ def parse_target_image(raw):
                 max(1, row_crop.width * 3), max(1, row_crop.height * 3)
             ), Image.Resampling.LANCZOS)
             label_text = pytesseract.image_to_string(
-                row_crop, lang="vie+eng", config="--psm 11"
+                row_crop, lang="vie+eng", config="--psm 6"
             )
-            label = re.sub(r"\\s+", " ", label_text).strip()
-            label = re.sub(r"^(?:[+*#©®|]+\\s*)+", "", label)
-            label = re.sub(r"\\b(?:DT|SL|ICT|DV|or|opr|st|si|srL)\\b", "", label, flags=re.I)
-            label = re.sub(r"\\s+", " ", label).strip(" -|+")
+            label = re.sub(r"\s+", " ", label_text).strip()
+            label = re.sub(r"^(?:[+*#©®|]+\s*)+", "", label)
+            label = re.sub(r"\b(?:DT|SL|ICT|DV|or|opr|st|si|srL)\b", "", label, flags=re.I)
+            label = re.sub(r"\s+", " ", label).strip(" -|+")
 
             # TARGET chỉ lấy token nằm đúng vùng cột TARGET và đúng dải Y của dòng.
             row_target = [
@@ -324,7 +334,12 @@ def parse_target_image(raw):
 
         return pd.DataFrame(records)
 
-    # Fallback cho ảnh bảng dạng Excel cũ: giữ nguyên cơ chế cũ, nhưng chỉ đọc TARGET.
+    # Không dùng ảnh bảng Excel cũ làm nguồn tháng 11 vì ảnh đó không có cột THỰC HIỆN.
+    # Nếu ảnh không phải màn hình điện thoại mới, báo rõ để người dùng thay đúng ảnh.
+    raise ValueError(
+        f"Ảnh Lũy kế '{w}×{h}' không đúng định dạng mới. Hãy thay bằng ảnh chụp màn hình điện thoại "
+        "có đủ cột CHƯƠNG TRÌNH, THỰC HIỆN, TARGET, % HT. Không dùng ảnh bảng Excel tháng 10."
+    )
     row_lines, group_x, target_x = find_target_table_geometry(bgr)
     records = []
     for i in range(len(row_lines) - 1):
