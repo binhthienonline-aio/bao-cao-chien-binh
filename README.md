@@ -30,3 +30,11 @@
 - Sửa lỗi lệch hàng: bắt đầu tại dòng dữ liệu đầu tiên, không đưa hàng tiêu đề vào danh sách 38 nhóm.
 - OCR doanh số LŨY KẾ chạy 3 lượt độc lập; chỉ nhận số khi cả 3 lượt thống nhất. Nếu bất đồng, để trống và đánh dấu cần kiểm tra, không tự đoán.
 - Công thức phân bổ: `LŨY KẾ cửa hàng × tỷ lệ Dashboard / 100`.
+
+
+## V5.5 — LŨY KẾ OCR DECIMAL FIX
+
+- Giữ nguyên chế độ LŨY KẾ ONLY; không đọc hoặc dùng TARGET.
+- Chuẩn hóa số OCR theo định dạng hiển thị 2 chữ số thập phân của ảnh nguồn (ví dụ 7575 → 75.75; 659 → 6.59; 20 → 20.00).
+- Tăng kích thước vùng số trước OCR; dùng 4 cách tiền xử lý ảnh khác nhau: grayscale, sharpen, Otsu và adaptive threshold.
+- Chỉ tự xác nhận khi ít nhất 3 cách tiền xử lý cùng đọc ra một giá trị và không có giá trị khác có số phiếu bằng hoặc cao hơn. Nếu không đủ đồng thuận, để trống để kiểm tra, không đoán.

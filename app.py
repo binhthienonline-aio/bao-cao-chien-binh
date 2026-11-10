@@ -318,63 +318,99 @@ def find_target_table_geometry(bgr):
     luyke_x = detect_luyke_column_from_header(bgr)
     return row_lines, group_x, luyke_x, None
 
+def _parse_luyke_ocr_value(txt):
+    """Parse OCR for source cells formatted to two decimal places."""
+    if not txt:
+        return None
+    s = str(txt).strip().replace(" ", "").replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    token = m.group(0)
+    try:
+        if "." in token:
+            return round(float(token), 2)
+        digits = re.sub(r"\D", "", token)
+        if not digits:
+            return None
+        # LŨY KẾ screenshot cells are formatted with 2 decimal places:
+        # 7575 -> 75.75; 659 -> 6.59; 20 -> 20.00.
+        if len(digits) <= 2:
+            return round(float(digits), 2)
+        return round(float(digits[:-2] + "." + digits[-2:]), 2)
+    except (ValueError, TypeError):
+        return None
+
+
 def parse_target_image(raw):
     bgr = image_bytes_to_bgr(raw)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
-    h, w = bgr.shape[:2]
     row_lines, group_x, luyke_x, _ = find_target_table_geometry(bgr)
     records = []
 
     for i in range(len(row_lines) - 1):
         y0, y1 = row_lines[i], row_lines[i + 1]
         name_crop = pil.crop((group_x[0] + 3, y0 + 3, group_x[1] - 3, y1 - 3))
-        name_crop = name_crop.resize((max(1, name_crop.width * 2),
-                                      max(1, name_crop.height * 2)))
+        name_crop = name_crop.resize((max(1, name_crop.width * 3),
+                                      max(1, name_crop.height * 3)),
+                                     Image.Resampling.LANCZOS)
         name_text = pytesseract.image_to_string(
             name_crop, lang="vie+eng", config="--psm 6"
         )
         name = re.sub(r"\s+", " ", name_text).strip(" \n\t-:")
         name = re.sub(r"^Máy say\b", "Máy sấy", name, flags=re.IGNORECASE)
 
-        number_crop = pil.crop((luyke_x[0] + 3, y0 + 3, luyke_x[1] - 3, y1 - 3))
+        number_crop = pil.crop((luyke_x[0] + 2, y0 + 2, luyke_x[1] - 2, y1 - 2))
         number_crop = number_crop.resize(
-            (max(1, number_crop.width * 4), max(1, number_crop.height * 4)),
+            (max(1, number_crop.width * 6), max(1, number_crop.height * 6)),
             Image.Resampling.LANCZOS
         )
-        gray_num = ImageOps.grayscale(number_crop)
-        arr = np.asarray(gray_num)
-        # Separate OCR passes. Decimal-aware OCR and digit-only OCR are
-        # compared; conflicting readings are left blank for review, never guessed.
-        candidates = []
-        raw_reads = []
-        threshold = Image.fromarray(np.where(arr > 150, 255, 0).astype("uint8"))
-        passes = [
-            ("threshold150/psm7", threshold, 7),
-            ("gray/psm8", gray_num, 8),
-            ("threshold150/psm13", threshold, 13)
+        gray = ImageOps.grayscale(number_crop)
+        arr = np.asarray(gray)
+
+        # Build genuinely different image preparations, not repeated OCR of
+        # the same threshold image. The cell is tiny, so enlarge and sharpen.
+        sharpen = Image.fromarray(cv2.addWeighted(
+            np.asarray(gray), 1.8,
+            cv2.GaussianBlur(np.asarray(gray), (0, 0), 1.2), -0.8, 0
+        ))
+        otsu_arr = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        adaptive_arr = cv2.adaptiveThreshold(
+            arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 21, 7
+        )
+        variants = [
+            ("gray", gray),
+            ("sharpen", sharpen),
+            ("otsu", Image.fromarray(otsu_arr)),
+            ("adaptive", Image.fromarray(adaptive_arr)),
         ]
-        for label, variant, psm in passes:
+
+        raw_reads = []
+        votes = []
+        for label, variant in variants:
+            # Use one-line segmentation for each distinct preprocessing.
             txt = pytesseract.image_to_string(
                 variant, lang="eng",
-                config=f"--psm {psm} -c tessedit_char_whitelist=0123456789,."
+                config="--psm 7 -c tessedit_char_whitelist=0123456789,."
             ).strip()
             raw_reads.append(f"{label}:{txt}")
-            value = parse_numeric(txt)
-            # Digit-only output is interpreted using the source's fixed
-            # two-decimal display (e.g. 3261 -> 32.61).
-            compact_digits = re.sub(r"[^0-9]", "", txt)
-            if txt and not re.search(r"[.,]", txt) and len(compact_digits) >= 3:
-                try:
-                    value = float(compact_digits[:-2] + "." + compact_digits[-2:])
-                except ValueError:
-                    value = None
-            candidates.append(round(float(value), 2) if value is not None else None)
+            value = _parse_luyke_ocr_value(txt)
+            if value is not None:
+                votes.append(value)
 
-        # All three independent passes must agree. Any disagreement remains
-        # blank for manual verification instead of silently exporting a wrong value.
-        valid = [v for v in candidates if v is not None]
-        luyke = valid[0] if len(valid) == 3 and len(set(valid)) == 1 else None
+        # Accept only a strict majority across different image preparations.
+        # If OCR variants disagree, leave the cell blank for human review.
+        vote_counts = {}
+        for value in votes:
+            vote_counts[value] = vote_counts.get(value, 0) + 1
+        ordered = sorted(vote_counts.items(), key=lambda item: item[1], reverse=True)
+        luyke = None
+        if ordered and ordered[0][1] >= 3 and (
+            len(ordered) == 1 or ordered[0][1] > ordered[1][1]
+        ):
+            luyke = ordered[0][0]
 
         records.append({
             "STT": i + 1,
