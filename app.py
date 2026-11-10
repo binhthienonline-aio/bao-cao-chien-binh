@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Báo cáo Chiến Binh V5", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Báo cáo Chiến Binh V5.4", page_icon="📊", layout="wide")
 st.markdown("""
 <style>
 .block-container{max-width:1600px;padding-top:1.1rem}
@@ -25,7 +25,7 @@ div.stButton>button,div.stDownloadButton>button{border-radius:8px;font-weight:65
 </style>
 """, unsafe_allow_html=True)
 st.markdown(
-    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5.3 LŨY KẾ HEADER FIX</h1>'
+    '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5.4 LŨY KẾ ONLY</h1>'
     '<p>Chỉ đọc ảnh tháng 11 • Lũy kế là doanh số gốc • Dashboard là tỷ lệ phân bổ • Xuất Excel và PNG theo mẫu</p></div>',
     unsafe_allow_html=True
 )
@@ -150,85 +150,108 @@ def _norm_ocr_token(value):
     return "".join(ch for ch in value if unicodedata.category(ch) != "Mn" and ch.isalnum())
 
 def detect_luyke_column_from_header(bgr):
-    """Locate the actual LŨY KẾ header cell in the colored table-header band.
+    """Find the LŨY KẾ column by its own header text and table grid.
 
-    Do not OCR the green report title: it also contains the words 'LŨY KẾ'.
-    Instead isolate the blue column-header band, enlarge it, and use the
-    horizontal positions of LŨY KẾ, MỤC TIÊU and TARGET to bound the column.
+    TARGET and MỤC TIÊU are intentionally not required. Once the LŨY KẾ
+    header is located, its x-coordinate is bounded by the nearest vertical
+    table rules detected across the data body. This avoids confusing LŨY KẾ
+    with TARGET and avoids failing when OCR misses a neighboring header.
     """
     h, w = bgr.shape[:2]
     b, g, r = cv2.split(bgr)
-    # The source report uses a blue header row; the green title row is excluded.
     blue = (b > 65) & (b > g * 1.12) & (b > r * 1.12) & (r < 175)
     row_counts = blue.sum(axis=1)
     active_rows = np.where(row_counts > max(3, int(w * 0.12)))[0]
     if len(active_rows) == 0:
         raise ValueError("Không tìm thấy dải tiêu đề màu xanh của bảng Lũy kế.")
-    # Pick the strongest compact horizontal band, avoiding scattered blue pixels.
-    runs = _runs(np.isin(np.arange(h), active_rows))
-    bands = [(a, z) for a, z, length in runs if length >= 3]
+    bands = [(a, z) for a, z, length in _runs(np.isin(np.arange(h), active_rows)) if length >= 3]
     if not bands:
         raise ValueError("Không xác định được hàng tiêu đề cột Lũy kế.")
     y0, y1 = max(bands, key=lambda band: row_counts[band[0]:band[1] + 1].sum())
     y0, y1 = max(0, y0 - 1), min(h, y1 + 2)
 
-    scale = max(4, min(10, int(1800 / max(1, w))))
-    header = cv2.resize(bgr[y0:y1, :], None, fx=scale, fy=scale,
-                        interpolation=cv2.INTER_CUBIC)
-    data = pytesseract.image_to_data(
-        header, lang="vie+eng", config="--psm 6",
-        output_type=pytesseract.Output.DICT
-    )
-    words = []
-    for i, raw in enumerate(data.get("text", [])):
-        token = _norm_ocr_token(raw)
-        if not token:
-            continue
-        cx = (data["left"][i] + data["width"][i] / 2) / scale
-        cy = (data["top"][i] + data["height"][i] / 2) / scale + y0
-        words.append((token, cx, cy))
+    # OCR the blue header at several scales/segmentations; only accept a
+    # token that explicitly contains LŨY KẾ (including common OCR variants).
+    header_raw = bgr[y0:y1, :]
+    candidates = []
+    for scale in (4, 6, 8):
+        enlarged = cv2.resize(header_raw, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_CUBIC)
+        variants = [enlarged]
+        lab = cv2.cvtColor(enlarged, cv2.COLOR_BGR2LAB)
+        L = lab[:, :, 0]
+        # A mild contrast variant helps when white header text is anti-aliased.
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(L)
+        variants.append(cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR))
+        for variant in variants:
+            for psm in (6, 11):
+                data = pytesseract.image_to_data(
+                    variant, lang="vie+eng", config=f"--psm {psm}",
+                    output_type=pytesseract.Output.DICT
+                )
+                for i, raw in enumerate(data.get("text", [])):
+                    token = _norm_ocr_token(raw)
+                    if not token:
+                        continue
+                    # Examples: LUYKE, LUYKEE, LUYKEE, LUYKE.
+                    if ("LUYKE" in token or "UYKE" in token or
+                            (token.startswith("LUY") and "KE" in token)):
+                        cx = (data["left"][i] + data["width"][i] / 2) / scale
+                        candidates.append((cx, token))
 
-    # Common OCR variants include LUYKE, LUYKEE, LUY + KE, and LOY + KE.
-    luy_candidates = [(t, x) for t, x, _ in words
-                      if "LUYKE" in t or "LUYKEE" in t or "UYKE" in t]
-    if not luy_candidates:
-        luy_words = [(t, x, y) for t, x, y in words
-                     if t.startswith(("LUY", "LOY"))]
-        ke_words = [(t, x, y) for t, x, y in words if t.startswith("KE")]
-        for lt, lx, ly in luy_words:
-            nearby = [(abs(kx - lx), kx) for kt, kx, ky in ke_words
-                      if abs(ky - ly) <= max(8, (y1 - y0) * 0.45)
-                      and 0 <= kx - lx <= w * 0.12]
-            if nearby:
-                _, kx = min(nearby)
-                luy_candidates.append(("LUYKE", (lx + kx) / 2))
-    target_words = [(t, x) for t, x, _ in words if t.startswith("TARGET")]
-    prev_words = [(t, x) for t, x, _ in words
-                  if t.startswith(("MUC", "TIEU", "MUCTIEU"))]
-
-    if not luy_candidates or not target_words or not prev_words:
+    if not candidates:
         raise ValueError(
-            "Không nhận diện chắc chắn ô tiêu đề LŨY KẾ trong hàng tiêu đề màu xanh. "
-            "Ứng dụng đã dừng để tránh lấy nhầm TARGET."
+            "Không đọc được chữ LŨY KẾ trong hàng tiêu đề. "
+            "Hãy tải ảnh có đủ hàng tiêu đề và không bị cắt."
         )
 
-    # Select the LŨY KẾ token lying between MỤC TIÊU and TARGET.
-    candidates = []
-    for _, lx in luy_candidates:
-        prev = [x for _, x in prev_words if x < lx]
-        nxt = [x for _, x in target_words if x > lx]
-        if prev and nxt:
-            px, tx = max(prev), min(nxt)
-            if px < lx < tx:
-                candidates.append((abs((lx - px) - (tx - lx)), px, lx, tx))
-    if not candidates:
-        raise ValueError("Đã thấy chữ LŨY KẾ nhưng không xác định được ranh giới cột an toàn.")
-    _, px, lx, tx = min(candidates)
-    x0 = max(0, int(round((px + lx) / 2)))
-    x1 = min(w, int(round((lx + tx) / 2)))
-    if x1 - x0 < w * 0.025:
-        raise ValueError("Không xác định được bề rộng cột LŨY KẾ. Vui lòng dùng ảnh rõ tiêu đề.")
-    return (x0, x1)
+    # Use the candidate nearest the expected LŨY KẾ region among repeated
+    # OCR hits. The header's own grid boundaries determine the actual cell.
+    # Find vertical rules over the data body; they remain visible even when
+    # the neighboring header text is split into multiple OCR tokens.
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    body_y0 = min(h - 1, y1 + 2)
+    body = gray[body_y0:, :]
+    if body.shape[0] < h * 0.25:
+        body = gray[y0:y1, :]
+    darkness = (body < 205).mean(axis=0)
+    active = darkness > 0.48
+    vlines = []
+    for a, z, length in _runs(active):
+        if length <= max(8, int(w * 0.006)):
+            vlines.append((a + z) / 2)
+
+    # Keep only boundaries inside the table, excluding outer image edges.
+    vlines = [x for x in vlines if w * 0.005 < x < w * 0.995]
+    if len(vlines) < 4:
+        # Fallback: detect rules from horizontal edge strength across the
+        # complete table area with a less strict threshold.
+        darkness = (body < 235).mean(axis=0)
+        active = darkness > 0.55
+        vlines = [(a + z) / 2 for a, z, length in _runs(active)
+                  if length <= max(10, int(w * 0.008))
+                  and w * 0.005 < (a + z) / 2 < w * 0.995]
+    if len(vlines) < 4:
+        raise ValueError("Đã đọc chữ LŨY KẾ nhưng không tìm được đường biên cột an toàn.")
+
+    # The image may be photographed with slight perspective. For each OCR
+    # candidate, find the pair of detected rules that encloses its center.
+    best = None
+    for cx, token in candidates:
+        left = [x for x in vlines if x < cx]
+        right = [x for x in vlines if x > cx]
+        if not left or not right:
+            continue
+        x0, x1 = max(left), min(right)
+        width = x1 - x0
+        if w * 0.025 <= width <= w * 0.20:
+            score = abs(cx - (x0 + x1) / 2) / max(1, width)
+            if best is None or score < best[0]:
+                best = (score, x0, x1, token)
+    if best is None:
+        raise ValueError("Không xác định được hai đường biên của cột LŨY KẾ.")
+    _, x0, x1, _ = best
+    return (max(0, int(round(x0))), min(w, int(round(x1))))
 
 def find_target_table_geometry(bgr):
     """Find the monthly Luy ke table, including wrapped rows in the mobile screenshot."""
@@ -264,7 +287,10 @@ def find_target_table_geometry(bgr):
     # separators are faint/missing in the screenshot; infer them from the
     # stable row pitch. This yields all 38 data rows in the supplied image.
     base_pitch = float(np.median(np.diff(best_seq)))
-    row_lines = [int(best_seq[0] - 2 * base_pitch)]
+    # best_seq contains the 38 lower borders of the 38 data rows.
+    # The first data row starts one normal row-pitch above the first border;
+    # starting two pitches above accidentally included the header as a data row.
+    row_lines = [int(round(best_seq[0] - base_pitch))]
     for y in best_seq:
         gap = y - row_lines[-1]
         if gap > 1.5 * base_pitch:
@@ -273,9 +299,6 @@ def find_target_table_geometry(bgr):
             for k in range(1, parts):
                 row_lines.append(int(round(prev + gap * k / parts)))
         row_lines.append(int(y))
-    # Include the final data-row boundary when the mobile screenshot clips its faint bottom rule.
-    if row_lines:
-        row_lines.append(int(min(h - 1, round(row_lines[-1] + base_pitch))))
 
     # Detect vertical separators across the data body.
     y0, y1 = row_lines[0], row_lines[-1]
@@ -300,34 +323,65 @@ def parse_target_image(raw):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     h, w = bgr.shape[:2]
-    row_lines, group_x, luyke_x, target_x = find_target_table_geometry(bgr)
+    row_lines, group_x, luyke_x, _ = find_target_table_geometry(bgr)
     records = []
+
     for i in range(len(row_lines) - 1):
         y0, y1 = row_lines[i], row_lines[i + 1]
-        # Use the whole row height and crop away vertical borders.
         name_crop = pil.crop((group_x[0] + 3, y0 + 3, group_x[1] - 3, y1 - 3))
-        name_crop = name_crop.resize((name_crop.width * 2, name_crop.height * 2))
-        name_text = pytesseract.image_to_string(name_crop, lang="vie+eng", config="--psm 6")
+        name_crop = name_crop.resize((max(1, name_crop.width * 2),
+                                      max(1, name_crop.height * 2)))
+        name_text = pytesseract.image_to_string(
+            name_crop, lang="vie+eng", config="--psm 6"
+        )
         name = re.sub(r"\s+", " ", name_text).strip(" \n\t-:")
         name = re.sub(r"^Máy say\b", "Máy sấy", name, flags=re.IGNORECASE)
-        luyke_crop = pil.crop((luyke_x[0] + 3, y0 + 3, luyke_x[1] - 3, y1 - 3))
-        luyke_crop = luyke_crop.resize((max(1, luyke_crop.width * 2), max(1, luyke_crop.height * 2)))
-        luyke_text = pytesseract.image_to_string(
-            luyke_crop, lang="eng",
-            config="--psm 7 -c tessedit_char_whitelist=0123456789,."
+
+        number_crop = pil.crop((luyke_x[0] + 3, y0 + 3, luyke_x[1] - 3, y1 - 3))
+        number_crop = number_crop.resize(
+            (max(1, number_crop.width * 4), max(1, number_crop.height * 4)),
+            Image.Resampling.LANCZOS
         )
-        luyke = parse_numeric(luyke_text)
-        # TARGET is deliberately not read or used in the distribution calculation.
-        target_text = "BỎ QUA THEO YÊU CẦU: CHỈ DÙNG CỘT LŨY KẾ"
-        target = None
+        gray_num = ImageOps.grayscale(number_crop)
+        arr = np.asarray(gray_num)
+        # Separate OCR passes. Decimal-aware OCR and digit-only OCR are
+        # compared; conflicting readings are left blank for review, never guessed.
+        candidates = []
+        raw_reads = []
+        threshold = Image.fromarray(np.where(arr > 150, 255, 0).astype("uint8"))
+        passes = [
+            ("threshold150/psm7", threshold, 7),
+            ("gray/psm8", gray_num, 8),
+            ("threshold150/psm13", threshold, 13)
+        ]
+        for label, variant, psm in passes:
+            txt = pytesseract.image_to_string(
+                variant, lang="eng",
+                config=f"--psm {psm} -c tessedit_char_whitelist=0123456789,."
+            ).strip()
+            raw_reads.append(f"{label}:{txt}")
+            value = parse_numeric(txt)
+            # Digit-only output is interpreted using the source's fixed
+            # two-decimal display (e.g. 3261 -> 32.61).
+            compact_digits = re.sub(r"[^0-9]", "", txt)
+            if txt and not re.search(r"[.,]", txt) and len(compact_digits) >= 3:
+                try:
+                    value = float(compact_digits[:-2] + "." + compact_digits[-2:])
+                except ValueError:
+                    value = None
+            candidates.append(round(float(value), 2) if value is not None else None)
+
+        # All three independent passes must agree. Any disagreement remains
+        # blank for manual verification instead of silently exporting a wrong value.
+        valid = [v for v in candidates if v is not None]
+        luyke = valid[0] if len(valid) == 3 and len(set(valid)) == 1 else None
+
         records.append({
             "STT": i + 1,
             "Nhóm hàng": name,
             "Lũy kế cửa hàng": luyke,
-            "TARGET siêu thị": target,
             "OCR tên": name,
-            "OCR Lũy kế": luyke_text.strip(),
-            "OCR TARGET": target_text.strip(),
+            "OCR Lũy kế": " | ".join(raw_reads),
             "Trạng thái": "Đã đọc" if name and luyke is not None else "Cần kiểm tra"
         })
     return pd.DataFrame(records)
@@ -718,7 +772,7 @@ with st.sidebar:
     report_date = st.text_input("Ngày báo cáo", "09/11/2026")
     st.caption("Danh sách cố định 9 nhân viên theo thứ tự đã chốt.")
     st.caption("Doanh số nhân viên = LŨY KẾ cửa hàng × tỷ lệ hoàn thành Dashboard / 100.")
-    st.caption("TARGET chỉ để tham khảo; không tham gia công thức tính doanh số.")
+    st.caption("Chỉ dùng LŨY KẾ làm doanh số gốc; TARGET không được đọc hoặc dùng trong công thức.")
 
 for key, default in [
     ("image_items", []), ("parsed_target", None), ("dashboard_results", None),
@@ -789,7 +843,7 @@ with tabs[0]:
 
 with tabs[1]:
     st.markdown("### Phân tích ảnh Lũy kế và 9 Dashboard")
-    st.info("Tên nhóm đọc theo từng dòng. Doanh số chỉ lấy từ cột LŨY KẾ theo tiêu đề nhận diện trực tiếp; TARGET và các cột khác bị bỏ qua hoàn toàn. Tỷ lệ đọc từ từng thẻ trong Dashboard.")
+    st.info("Tên nhóm đọc theo từng dòng. Doanh số chỉ lấy từ cột LŨY KẾ, xác định bằng tiêu đề và đường biên cột. TARGET và mọi cột khác bị bỏ qua. Tỷ lệ đọc từ từng thẻ trong Dashboard.")
     if st.button("▶ PHÂN TÍCH 10 ẢNH", type="primary", disabled=not st.session_state.image_items):
         target_images, employee_files, missing_codes, duplicate_codes, other_files = identify_sources(st.session_state.image_items)
         if not target_images:
@@ -800,7 +854,7 @@ with tabs[1]:
             st.error("Trùng ảnh dashboard mã: " + ", ".join(duplicate_codes))
         else:
             try:
-                with st.spinner("Đang đọc danh mục và TARGET từ ảnh Lũy kế..."):
+                with st.spinner("Đang đọc tên nhóm và riêng cột LŨY KẾ từ ảnh..."):
                     target_df = parse_target_image(target_images[0][1])
                 st.session_state.parsed_target = target_df
                 st.session_state.target_editor = target_df.copy()
@@ -850,8 +904,8 @@ with tabs[2]:
     if st.session_state.parsed_target is None or st.session_state.dashboard_results is None:
         st.info("Chạy phân tích ảnh ở tab ② trước.")
     else:
-        st.markdown("### A. Rà soát danh mục, LŨY KẾ và TARGET từ ảnh gốc")
-        st.caption("LŨY KẾ là doanh số gốc để phân bổ. TARGET chỉ hiển thị tham khảo. Có thể sửa tên nhóm hoặc số OCR chưa đúng.")
+        st.markdown("### A. Rà soát danh mục và LŨY KẾ từ ảnh gốc")
+        st.caption("Chỉ cột LŨY KẾ là doanh số gốc để phân bổ. TARGET và các cột khác bị bỏ qua hoàn toàn. Có thể sửa tên nhóm hoặc số LŨY KẾ OCR chưa đúng.")
         target_input = st.data_editor(
             st.session_state.target_editor,
             use_container_width=True,
@@ -862,10 +916,8 @@ with tabs[2]:
                 "STT": st.column_config.NumberColumn("STT", disabled=True),
                 "Nhóm hàng": st.column_config.TextColumn("Tên nhóm hàng", required=True),
                 "Lũy kế cửa hàng": st.column_config.NumberColumn("LŨY KẾ cửa hàng", format="%.2f", required=True),
-                "TARGET siêu thị": st.column_config.NumberColumn("TARGET (tham khảo)", format="%.2f"),
                 "OCR tên": st.column_config.TextColumn("OCR tên gốc", disabled=True),
                 "OCR Lũy kế": st.column_config.TextColumn("OCR LŨY KẾ gốc", disabled=True),
-                "OCR TARGET": st.column_config.TextColumn("OCR TARGET gốc", disabled=True),
                 "Trạng thái": st.column_config.TextColumn(disabled=True)
             }
         )

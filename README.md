@@ -21,3 +21,12 @@
 
 ## Cài đặt GitHub / Streamlit Cloud
 Đưa `app.py`, `requirements.txt`, `packages.txt` và `README.md` vào thư mục gốc repository. Main file: `app.py`.
+
+
+## V5.4 — LŨY KẾ ONLY
+
+- Chỉ nhận diện cột **LŨY KẾ** từ tiêu đề và đường biên cột; không yêu cầu OCR phải đọc được tiêu đề TARGET hoặc MỤC TIÊU/NV.
+- Không đọc, không dùng TARGET trong công thức hoặc điều kiện tạo ma trận.
+- Sửa lỗi lệch hàng: bắt đầu tại dòng dữ liệu đầu tiên, không đưa hàng tiêu đề vào danh sách 38 nhóm.
+- OCR doanh số LŨY KẾ chạy 3 lượt độc lập; chỉ nhận số khi cả 3 lượt thống nhất. Nếu bất đồng, để trống và đánh dấu cần kiểm tra, không tự đoán.
+- Công thức phân bổ: `LŨY KẾ cửa hàng × tỷ lệ Dashboard / 100`.
