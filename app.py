@@ -26,7 +26,7 @@ div.stButton>button,div.stDownloadButton>button{border-radius:8px;font-weight:65
 """, unsafe_allow_html=True)
 st.markdown(
     '<div class="hero"><h1>📊 BÁO CÁO SỨC KHỎE CHIẾN BINH — V5</h1>'
-    '<p>Chỉ đọc ảnh tháng 11 • Lũy kế lấy TARGET • Dashboard lấy tỷ lệ • Xuất Excel và PNG theo mẫu</p></div>',
+    '<p>Chỉ đọc ảnh tháng 11 • Lũy kế là doanh số gốc • Dashboard là tỷ lệ phân bổ • Xuất Excel và PNG theo mẫu</p></div>',
     unsafe_allow_html=True
 )
 
@@ -111,7 +111,7 @@ def load_public_drive(url):
 def identify_sources(images):
     target = []
     employee_files = {}
-    others = []
+    unmatched = []
     for name, raw in images:
         n = norm(name)
         if "luy" in n and "ke" in n:
@@ -121,7 +121,12 @@ def identify_sources(images):
         if code:
             employee_files.setdefault(code, []).append((name, raw))
         else:
-            others.append(name)
+            unmatched.append((name, raw))
+    # If the ZIP has exactly one extra image besides the 9 named employee
+    # dashboards, treat it as the LŨY KẾ source even if its filename is generic.
+    if not target and len(unmatched) == 1:
+        target = unmatched
+    others = [name for name, _ in unmatched if not target or name != target[0][0]]
     missing = [c for c, _ in EMPLOYEES if c not in employee_files]
     duplicates = [c for c, v in employee_files.items() if len(v) > 1]
     return target, employee_files, missing, duplicates, others
@@ -140,50 +145,77 @@ def _runs(binary_array):
     return runs
 
 def find_target_table_geometry(bgr):
+    """Find the monthly Luy ke table, including wrapped rows in the mobile screenshot."""
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     x0, x1 = int(w * 0.015), int(w * 0.985)
-    scores = (gray[:, x0:x1] < 180).sum(axis=1)
-    active = scores > 0.85 * (x1 - x0)
+
+    # The current source is a mobile screenshot: grid lines are light grey,
+    # so use a lighter threshold than the older desktop-sheet parser.
+    scores = (gray[:, x0:x1] < 240).sum(axis=1)
+    active = scores > 0.80 * (x1 - x0)
     runs = _runs(active)
     thin_points = [a for a, b, length in runs if length <= 3 and a > int(h * 0.06)]
-    # Find the longest run of evenly spaced table row separators.
+
+    # Select the longest sequence allowing both normal rows (~2.4% H)
+    # and wrapped/tall rows (~4.8% H).
     best_seq = []
     for i, point in enumerate(thin_points):
         seq = [point]
         for nxt in thin_points[i + 1:]:
             gap = nxt - seq[-1]
-            if 0.017 * h <= gap <= 0.030 * h:
+            if 0.015 * h <= gap <= 0.055 * h:
                 seq.append(nxt)
-            elif gap > 0.030 * h:
+            elif gap > 0.055 * h:
                 break
         if len(seq) > len(best_seq):
             best_seq = seq
-    if len(best_seq) < 3:
-        raise ValueError("Không tìm thấy lưới dòng của ảnh Lũy kế.")
-    # Vertical table separators identify the group-name and TARGET columns.
-    y0, y1 = best_seq[0], best_seq[-1]
-    vscore = (gray[y0:y1 + 1, :] < 180).sum(axis=0)
-    vactive = vscore > 0.82 * (y1 - y0 + 1)
+
+    if len(best_seq) < 20:
+        raise ValueError("Không tìm thấy đủ đường kẻ của bảng Lũy kế tháng 11. Hãy dùng ảnh chụp đầy đủ bảng.")
+
+    # The first visible separator is the end of the table header. Some row
+    # separators are faint/missing in the screenshot; infer them from the
+    # stable row pitch. This yields all 38 data rows in the supplied image.
+    base_pitch = float(np.median(np.diff(best_seq)))
+    row_lines = [int(best_seq[0] - base_pitch)]
+    for y in best_seq:
+        gap = y - row_lines[-1]
+        if gap > 1.5 * base_pitch:
+            parts = max(2, int(round(gap / base_pitch)))
+            prev = row_lines[-1]
+            for k in range(1, parts):
+                row_lines.append(int(round(prev + gap * k / parts)))
+        row_lines.append(int(y))
+
+    # Detect vertical separators across the data body.
+    y0, y1 = row_lines[0], row_lines[-1]
+    vscore = (gray[y0:y1 + 1, :] < 240).sum(axis=0)
+    vactive = vscore > 0.80 * (y1 - y0 + 1)
     vlines = []
     for a, b, length in _runs(vactive):
         if length <= 4 and a > int(w * 0.01) and b < int(w * 0.995):
             vlines.append(int((a + b) / 2))
+
     if len(vlines) >= 8:
-        # Observed sheet structure: STT, Group, Expected %, Target/NV, Luy ke, TARGET, Con thieu, Tang/Giam.
+        # STT | Group | Expected | Target/NV | Luy ke | TARGET | Remaining | Change
         group_x = (vlines[1], vlines[2])
+        luyke_x = (vlines[4], vlines[5])
         target_x = (vlines[5], vlines[6])
     else:
+        # Fallback for the older exported worksheet layout.
         group_x = (int(w * 0.075), int(w * 0.354))
+        luyke_x = (int(w * 0.599), int(w * 0.688))
         target_x = (int(w * 0.688), int(w * 0.778))
-    return best_seq, group_x, target_x
+
+    return row_lines, group_x, luyke_x, target_x
 
 def parse_target_image(raw):
     bgr = image_bytes_to_bgr(raw)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     h, w = bgr.shape[:2]
-    row_lines, group_x, target_x = find_target_table_geometry(bgr)
+    row_lines, group_x, luyke_x, target_x = find_target_table_geometry(bgr)
     records = []
     for i in range(len(row_lines) - 1):
         y0, y1 = row_lines[i], row_lines[i + 1]
@@ -192,7 +224,16 @@ def parse_target_image(raw):
         name_crop = name_crop.resize((name_crop.width * 2, name_crop.height * 2))
         name_text = pytesseract.image_to_string(name_crop, lang="vie+eng", config="--psm 6")
         name = re.sub(r"\s+", " ", name_text).strip(" \n\t-:")
+        name = re.sub(r"^Máy say\b", "Máy sấy", name, flags=re.IGNORECASE)
+        luyke_crop = pil.crop((luyke_x[0] + 3, y0 + 3, luyke_x[1] - 3, y1 - 3))
+        luyke_crop = luyke_crop.resize((max(1, luyke_crop.width * 2), max(1, luyke_crop.height * 2)))
+        luyke_text = pytesseract.image_to_string(
+            luyke_crop, lang="eng",
+            config="--psm 7 -c tessedit_char_whitelist=0123456789,."
+        )
+        luyke = parse_numeric(luyke_text)
         target_crop = pil.crop((target_x[0] + 3, y0 + 3, target_x[1] - 3, y1 - 3))
+        target_crop = target_crop.resize((max(1, target_crop.width * 2), max(1, target_crop.height * 2)))
         target_text = pytesseract.image_to_string(
             target_crop, lang="eng",
             config="--psm 7 -c tessedit_char_whitelist=0123456789,."
@@ -201,10 +242,12 @@ def parse_target_image(raw):
         records.append({
             "STT": i + 1,
             "Nhóm hàng": name,
+            "Lũy kế cửa hàng": luyke,
             "TARGET siêu thị": target,
             "OCR tên": name,
+            "OCR Lũy kế": luyke_text.strip(),
             "OCR TARGET": target_text.strip(),
-            "Trạng thái": "Đã đọc" if name and target is not None else "Cần kiểm tra"
+            "Trạng thái": "Đã đọc" if name and luyke is not None else "Cần kiểm tra"
         })
     return pd.DataFrame(records)
 
@@ -583,9 +626,9 @@ def build_png(groups, matrix, report_date):
 with st.sidebar:
     st.markdown("### CẤU HÌNH BÁO CÁO")
     report_date = st.text_input("Ngày báo cáo", "09/11/2026")
-    staff_count = st.number_input("Số nhân viên", min_value=1, max_value=100, value=9, step=1)
-    st.caption("Mục tiêu cá nhân = TARGET siêu thị / số nhân viên.")
-    st.caption("Doanh số quy đổi = mục tiêu cá nhân × tỷ lệ Dashboard / 100. Không áp dụng hệ số 110%.")
+    st.caption("Danh sách cố định 9 nhân viên theo thứ tự đã chốt.")
+    st.caption("Doanh số nhân viên = LŨY KẾ cửa hàng × tỷ lệ hoàn thành Dashboard / 100.")
+    st.caption("TARGET chỉ để tham khảo; không tham gia công thức tính doanh số.")
 
 for key, default in [
     ("image_items", []), ("parsed_target", None), ("dashboard_results", None),
@@ -717,8 +760,8 @@ with tabs[2]:
     if st.session_state.parsed_target is None or st.session_state.dashboard_results is None:
         st.info("Chạy phân tích ảnh ở tab ② trước.")
     else:
-        st.markdown("### A. Rà soát danh mục và TARGET từ ảnh Lũy kế")
-        st.caption("Anh có thể sửa tên nhóm hoặc TARGET nếu OCR đọc chưa đúng. Thứ tự dòng được giữ nguyên.")
+        st.markdown("### A. Rà soát danh mục, LŨY KẾ và TARGET từ ảnh gốc")
+        st.caption("LŨY KẾ là doanh số gốc để phân bổ. TARGET chỉ hiển thị tham khảo. Có thể sửa tên nhóm hoặc số OCR chưa đúng.")
         target_input = st.data_editor(
             st.session_state.target_editor,
             use_container_width=True,
@@ -728,8 +771,10 @@ with tabs[2]:
             column_config={
                 "STT": st.column_config.NumberColumn("STT", disabled=True),
                 "Nhóm hàng": st.column_config.TextColumn("Tên nhóm hàng", required=True),
-                "TARGET siêu thị": st.column_config.NumberColumn("TARGET siêu thị", format="%.2f", required=True),
-                "OCR tên": st.column_config.TextColumn("OCR gốc", disabled=True),
+                "Lũy kế cửa hàng": st.column_config.NumberColumn("LŨY KẾ cửa hàng", format="%.2f", required=True),
+                "TARGET siêu thị": st.column_config.NumberColumn("TARGET (tham khảo)", format="%.2f"),
+                "OCR tên": st.column_config.TextColumn("OCR tên gốc", disabled=True),
+                "OCR Lũy kế": st.column_config.TextColumn("OCR LŨY KẾ gốc", disabled=True),
                 "OCR TARGET": st.column_config.TextColumn("OCR TARGET gốc", disabled=True),
                 "Trạng thái": st.column_config.TextColumn(disabled=True)
             }
@@ -738,15 +783,15 @@ with tabs[2]:
         group_names = target_input["Nhóm hàng"].astype(str).tolist()
         if len(set(norm(x) for x in group_names)) != len(group_names):
             st.error("Tên nhóm hàng bị trùng sau khi chuẩn hóa. Hãy sửa tên trước khi tạo ma trận.")
-        if target_input["TARGET siêu thị"].isna().any() or not all(str(x).strip() for x in group_names):
-            st.warning("Còn tên nhóm hoặc TARGET chưa đọc được. Hãy sửa các ô trống trước khi tạo ma trận.")
+        if target_input["Lũy kế cửa hàng"].isna().any() or not all(str(x).strip() for x in group_names):
+            st.warning("Còn tên nhóm hoặc LŨY KẾ chưa đọc được. Hãy sửa các ô trống trước khi tạo ma trận.")
 
         st.divider()
         st.markdown("### B. Tạo ma trận tỷ lệ 9 nhân viên × nhóm hàng")
         st.caption("Tỷ lệ từ thẻ được giữ nguyên, 0 chỉ lấy từ danh sách 'Chưa có số liệu'. Ô không đọc được để trống.")
         if st.button("TẠO / CẬP NHẬT MA TRẬN", type="primary"):
-            if target_input["TARGET siêu thị"].isna().any() or not all(str(x).strip() for x in group_names):
-                st.error("Hãy hoàn tất danh mục và TARGET trước.")
+            if target_input["Lũy kế cửa hàng"].isna().any() or not all(str(x).strip() for x in group_names):
+                st.error("Hãy hoàn tất tên nhóm và LŨY KẾ trước.")
             elif len(set(norm(x) for x in group_names)) != len(group_names):
                 st.error("Tên nhóm hàng bị trùng.")
             else:
@@ -797,16 +842,15 @@ with tabs[3]:
         st.info("Hoàn tất bước ③ để xem trước.")
     else:
         groups = st.session_state.target_editor["Nhóm hàng"].astype(str).tolist()
-        targets = pd.to_numeric(st.session_state.target_editor["TARGET siêu thị"], errors="coerce")
+        luykes = pd.to_numeric(st.session_state.target_editor["Lũy kế cửa hàng"], errors="coerce")
         rates = st.session_state.matrix_editor.copy()
         missing_rates = int(rates[groups].isna().sum().sum())
-        missing_targets = int(targets.isna().sum())
-        if missing_rates or missing_targets:
-            st.warning(f"Còn {missing_rates} ô tỷ lệ và {missing_targets} TARGET chưa xác minh. Bảng sẽ giữ trống các ô chưa đủ dữ liệu.")
-        individual_targets = targets / int(staff_count)
+        missing_luykes = int(luykes.isna().sum())
+        if missing_rates or missing_luykes:
+            st.warning(f"Còn {missing_rates} ô tỷ lệ và {missing_luykes} LŨY KẾ chưa xác minh. Bảng sẽ giữ trống các ô chưa đủ dữ liệu.")
         sales = rates.copy()
         for j, group in enumerate(groups):
-            sales[group] = individual_targets.iloc[j] * pd.to_numeric(rates[group], errors="coerce") / 100
+            sales[group] = luykes.iloc[j] * pd.to_numeric(rates[group], errors="coerce") / 100
         st.markdown("### Bảng xem trước doanh số — theo mẫu đã chốt")
         preview = sales.copy()
         total = {"Nhân viên": "TỔNG"}
@@ -829,6 +873,33 @@ with tabs[3]:
             .format({g:"{:,.2f}" for g in groups}, na_rep=""))
         st.dataframe(styled, use_container_width=True, height=540, hide_index=True)
 
+        # Reconcile the employee allocation against each store LŨY KẾ value.
+        # A mismatch is displayed, never silently normalized to 100%.
+        allocation_rows = []
+        for j, group in enumerate(groups):
+            pct_sum = pd.to_numeric(rates[group], errors="coerce").sum(min_count=1)
+            allocated = pd.to_numeric(sales[group], errors="coerce").sum(min_count=1)
+            source_value = luykes.iloc[j]
+            delta = (allocated - source_value) if pd.notna(allocated) and pd.notna(source_value) else np.nan
+            allocation_rows.append({
+                "Nhóm hàng": group,
+                "Lũy kế gốc": source_value,
+                "Tổng tỷ lệ 9 NV (%)": pct_sum,
+                "Tổng đã phân bổ": allocated,
+                "Chênh lệch": delta
+            })
+        allocation_audit = pd.DataFrame(allocation_rows)
+        mismatches = allocation_audit[
+            allocation_audit["Tổng tỷ lệ 9 NV (%)"].notna()
+            & ((allocation_audit["Tổng tỷ lệ 9 NV (%)"] - 100).abs() > 0.05)
+        ]
+        if len(mismatches):
+            st.warning(f"Có {len(mismatches)} nhóm có tổng tỷ lệ 9 nhân viên khác 100%. Doanh số từng người vẫn tính đúng theo công thức LŨY KẾ × tỷ lệ; không tự ép tỷ lệ về 100%.")
+            with st.expander("Đối soát tỷ lệ và doanh số phân bổ theo nhóm"):
+                st.dataframe(allocation_audit, use_container_width=True, hide_index=True)
+        else:
+            st.success("Tổng tỷ lệ 9 nhân viên đạt 100% ở các nhóm đã có đủ dữ liệu; doanh số phân bổ khớp LŨY KẾ.")
+
         st.markdown("### Tình trạng xác minh")
         c1, c2, c3 = st.columns(3)
         c1.metric("Nhóm hàng tháng 11", len(groups))
@@ -837,7 +908,7 @@ with tabs[3]:
 
         audit_df = st.session_state.card_audit if st.session_state.card_audit is not None else pd.DataFrame()
         # Output as draft when blanks remain; blank cells stay blank, never silently become zero.
-        xlsx = build_excel(groups, sales, rates, report_date, staff_count, audit_df)
+        xlsx = build_excel(groups, sales, rates, report_date, len(sales), audit_df)
         png = build_png(groups, sales, report_date)
         a, b = st.columns(2)
         a.download_button(
@@ -852,7 +923,7 @@ with tabs[3]:
             "image/png",
             use_container_width=True
         )
-        if missing_rates or missing_targets:
+        if missing_rates or missing_luykes:
             st.warning("Đây là bản nháp: các ô chưa xác minh đang để trống. Không dùng để chốt thi đua cho đến khi hoàn tất.")
         else:
             st.success("Đã đủ dữ liệu đầu vào. Vui lòng đối chiếu ngẫu nhiên với ảnh gốc trước khi chốt.")
