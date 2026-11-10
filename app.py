@@ -272,6 +272,7 @@ def match_group(card_label, groups):
             score = max(
                 fuzz.token_set_ratio(c_norm, g_norm),
                 fuzz.ratio(c_compact, g_compact),
+                fuzz.partial_ratio(c_compact, g_compact) * 0.90,
             )
         scored.append((score, len(g_tokens), idx, group))
     scored.sort(reverse=True)
@@ -292,29 +293,37 @@ def extract_no_data(raw, groups):
     crop = ImageOps.grayscale(crop.resize((crop.width * 2, crop.height * 2)))
     crop = ImageEnhance.Contrast(crop).enhance(1.5)
     text = pytesseract.image_to_string(crop, lang="vie+eng", config="--psm 6")
-    ntext = norm(text)
-    start = ntext.find("chua co so lieu")
-    if start < 0:
-        return None, [], text
-    tail = ntext[start + len("chua co so lieu"):]
-    # Count displayed in parentheses after the heading.
-    count_match = re.match(r"\s*\(?\s*(\d+)\s*\)?\s*:?\s*", tail)
+    lines = text.splitlines()
+    start_line = None
+    start_idx = None
+    for i, line in enumerate(lines):
+        if "chua co so lieu" in norm(line):
+            start_line = line
+            start_idx = i
+            break
+    if start_idx is None:
+        return None, {}, text
+
+    head = norm(start_line)
+    count_match = re.search(r"chua co so lieu\s*\(?\s*(\d+)\s*\)?", head)
     expected = int(count_match.group(1)) if count_match else None
-    if count_match:
-        tail = tail[count_match.end():]
-    stop = tail.find("sieu thi khong co target")
-    if stop >= 0:
-        tail = tail[:stop]
-    # Categories are separated by hyphens. Composite groups such as Máy lọc KK / Hút bụi / Hút ẩm
-    # can appear as three adjacent segments; duplicate matches are collapsed to one group.
-    segments = [s.strip(" :;,.") for s in re.split(r"\s+-\s+", tail) if s.strip(" :;,.")]
+    colon = start_line.find(":")
+    tail_lines = [start_line[colon + 1:] if colon >= 0 else ""]
+    for line in lines[start_idx + 1:]:
+        if "sieu thi khong co target" in norm(line):
+            break
+        tail_lines.append(line)
+    raw_tail = " ".join(tail_lines)
+    # Preserve separators before accent normalization. Some composite categories are split
+    # into sub-parts (e.g. Máy lọc KK - Hút bụi - Hút ẩm); duplicate category matches collapse.
+    segments = [seg.strip(" :;,.\t") for seg in re.split(r"\s*[-–—]\s*|\s*:\s*", raw_tail) if seg.strip(" :;,.\t")]
     matched = {}
     evidence = {}
-    for seg in segments:
-        idx, score, status = match_group(seg, groups)
+    for segment in segments:
+        idx, score, status = match_group(segment, groups)
         if idx is not None and idx not in matched:
             matched[idx] = 0.0
-            evidence[idx] = seg
+            evidence[idx] = segment
     return expected, matched, text
 
 def parse_dashboard(raw, groups, code, employee_name):
@@ -379,7 +388,7 @@ def parse_dashboard(raw, groups, code, employee_name):
         "zero_raw": zero_raw
     }
 
-def build_excel(groups, targets, matrix, rates, report_date, factor, staff, audit_df):
+def build_excel(groups, targets, sales, report_date, factor, staff, audit_df):
     wb = Workbook()
     ws = wb.active
     ws.title = "Báo cáo"
@@ -389,7 +398,6 @@ def build_excel(groups, targets, matrix, rates, report_date, factor, staff, audi
     for col, group in enumerate(groups, 2):
         ws.cell(1, col, group)
     ws.cell(2, 1, "TỔNG")
-    sales = matrix.copy()
     for j, group in enumerate(groups, 2):
         col_vals = pd.to_numeric(sales[group], errors="coerce")
         ws.cell(2, j, float(col_vals.sum()) if col_vals.notna().all() else None)
